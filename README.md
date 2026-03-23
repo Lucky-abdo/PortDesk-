@@ -31,11 +31,14 @@ Everything runs **locally on your machine**. Nothing is sent to the internet. Ev
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. System Requirements:
 
-```bash
-pip install flask flask-socketio pyautogui opencv-python mss psutil pyperclip sounddevice numpy Pillow cryptography
-```
+Python: 3.8 or higher.
+
+OS: Windows 7+ / Linux (Ubuntu, antiX, Debian).
+
+Installation:  pip install -r requirements.txt
+
 
 ### 2. Run the server
 
@@ -319,11 +322,3 @@ MIT License — see [LICENSE](LICENSE)
 ## notes
 
 --PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
-
---System Requirements:
-
-Python: 3.8 or higher.
-
-OS: Windows 7+ / Linux (Ubuntu, antiX, Debian).
-
-Installation:  pip install -r requirements.txt
