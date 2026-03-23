@@ -37,6 +37,8 @@ Python: 3.8 or higher.
 
 OS: Windows 7+ / Linux (Ubuntu, antiX, Debian).
 
+macOS: Version 10.14 (Mojave) or later.
+
 Installation:  pip install -r requirements.txt
 
 
