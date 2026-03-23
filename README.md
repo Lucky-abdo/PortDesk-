@@ -316,6 +316,14 @@ MIT License — see [LICENSE](LICENSE)
 
 ---
 
-## A note on development
+## notes
 
-PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
+--PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
+
+--System Requirements:
+
+Python: 3.8 or higher.
+
+OS: Windows 7+ / Linux (Ubuntu, antiX, Debian).
+
+Installation:  pip install -r requirements.txt
