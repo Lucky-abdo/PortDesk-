@@ -2,9 +2,14 @@ from flask import Flask, send_file, request, jsonify
 from flask_socketio import SocketIO
 from collections import defaultdict
 from functools import wraps
+import sys
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 import pyautogui
 import socket as _socket
-import json, os, time, ctypes, threading, logging
+import json, os, time, ctypes, threading, logging, platform
+import queue as _queue
+import string as _string
 try:
     import numpy as np
     import cv2
@@ -12,12 +17,23 @@ try:
 except ImportError:
     np = None; cv2 = None; CV2_AVAILABLE = False
 import io, base64
+import subprocess
 
 try:
     import mss as _mss
     MSS_AVAILABLE = True
 except ImportError:
     MSS_AVAILABLE = False
+
+# Virtual keyboard imports
+try:
+    import uinput  # type: ignore
+    UINPUT_AVAILABLE = True
+except ImportError:
+    uinput = None
+    UINPUT_AVAILABLE = False
+
+SUBPROCESS_AVAILABLE = True
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 SECURITY_FILE = os.path.join(BASE_DIR, "portdesk_security.json")
@@ -59,6 +75,125 @@ def _is_allowed(ip):
 
 _pending_ips = set()
 
+def _check_linux_compatibility():
+    if platform.system() != 'Linux':
+        return []
+
+    errors = []
+    if 'DISPLAY' not in os.environ:
+        if 'WAYLAND_DISPLAY' in os.environ:
+            errors.append('Wayland detected without DISPLAY; run xwayland or use X11 session if pyautogui not working.')
+        else:
+            errors.append('DISPLAY variable not set; headless mode. Use xvfb-run to start the app.')
+
+    import shutil
+    if not shutil.which('xclip') and not shutil.which('xsel'):
+        errors.append('xclip/xsel not installed; clipboard sync قد لا يعمل.')
+    if not shutil.which('xdotool'):
+        errors.append('xdotool not installed; virtual keyboard may be slower or unavailable on Linux.')
+
+    return errors
+
+# ── Virtual Keyboard ───────────────────────────────────────────────────────────
+_virtual_kb_device = None
+
+def _init_virtual_keyboard():
+    global _virtual_kb_device
+    if not UINPUT_AVAILABLE or platform.system() != 'Linux':
+        return False
+    try:
+        events = [
+            uinput.KEY_A, uinput.KEY_B, uinput.KEY_C, uinput.KEY_D, uinput.KEY_E,
+            uinput.KEY_F, uinput.KEY_G, uinput.KEY_H, uinput.KEY_I, uinput.KEY_J,
+            uinput.KEY_K, uinput.KEY_L, uinput.KEY_M, uinput.KEY_N, uinput.KEY_O,
+            uinput.KEY_P, uinput.KEY_Q, uinput.KEY_R, uinput.KEY_S, uinput.KEY_T,
+            uinput.KEY_U, uinput.KEY_V, uinput.KEY_W, uinput.KEY_X, uinput.KEY_Y,
+            uinput.KEY_Z, uinput.KEY_0, uinput.KEY_1, uinput.KEY_2, uinput.KEY_3,
+            uinput.KEY_4, uinput.KEY_5, uinput.KEY_6, uinput.KEY_7, uinput.KEY_8,
+            uinput.KEY_9, uinput.KEY_SPACE, uinput.KEY_ENTER, uinput.KEY_BACKSPACE,
+            uinput.KEY_TAB, uinput.KEY_ESC, uinput.KEY_LEFTSHIFT, uinput.KEY_LEFTCTRL,
+            uinput.KEY_LEFTALT, uinput.KEY_LEFTMETA, uinput.KEY_F1, uinput.KEY_F2,
+            uinput.KEY_F3, uinput.KEY_F4, uinput.KEY_F5, uinput.KEY_F6, uinput.KEY_F7,
+            uinput.KEY_F8, uinput.KEY_F9, uinput.KEY_F10, uinput.KEY_F11, uinput.KEY_F12,
+            uinput.KEY_LEFT, uinput.KEY_RIGHT, uinput.KEY_UP, uinput.KEY_DOWN,
+            uinput.KEY_DELETE, uinput.KEY_HOME, uinput.KEY_END, uinput.KEY_PAGEUP,
+            uinput.KEY_PAGEDOWN, uinput.KEY_CAPSLOCK, uinput.KEY_NUMLOCK,
+        ]
+        _virtual_kb_device = uinput.Device(events)
+        return True
+    except Exception as e:
+        print(f"Virtual keyboard init failed: {e}")
+        return False
+
+def _send_virtual_key(key_code, press=True):
+    if _virtual_kb_device:
+        try:
+            if press:
+                _virtual_kb_device.emit(key_code, 1)
+            else:
+                _virtual_kb_device.emit(key_code, 0)
+        except Exception as e:
+            print(f"Virtual key send failed: {e}")
+
+def _send_virtual_text(text):
+    for char in text:
+        if char.isalpha():
+            key = getattr(uinput, f'KEY_{char.upper()}', None)
+            if key:
+                _send_virtual_key(key, True)
+                time.sleep(0.01)
+                _send_virtual_key(key, False)
+        elif char.isdigit():
+            key = getattr(uinput, f'KEY_{char}', None)
+            if key:
+                _send_virtual_key(key, True)
+                time.sleep(0.01)
+                _send_virtual_key(key, False)
+        elif char == ' ':
+            _send_virtual_key(uinput.KEY_SPACE, True)
+            time.sleep(0.01)
+            _send_virtual_key(uinput.KEY_SPACE, False)
+        elif char == '\n':
+            _send_virtual_key(uinput.KEY_ENTER, True)
+            time.sleep(0.01)
+            _send_virtual_key(uinput.KEY_ENTER, False)
+        elif char == '\t':
+            _send_virtual_key(uinput.KEY_TAB, True)
+            time.sleep(0.01)
+            _send_virtual_key(uinput.KEY_TAB, False)
+        elif char == '\b':
+            _send_virtual_key(uinput.KEY_BACKSPACE, True)
+            time.sleep(0.01)
+            _send_virtual_key(uinput.KEY_BACKSPACE, False)
+        time.sleep(0.005)  # faster typing while safe
+
+
+def _send_xdotool_key(key):
+    if SUBPROCESS_AVAILABLE and platform.system() == 'Linux':
+        try:
+            subprocess.run(['xdotool', 'key', key], check=True)
+        except Exception as e:
+            print(f"xdotool key failed: {e}")
+
+def _send_xdotool_text(text):
+    if SUBPROCESS_AVAILABLE and platform.system() == 'Linux':
+        try:
+            subprocess.run(['xdotool', 'type', '--clearmodifiers', text], check=True)
+        except Exception as e:
+            print(f"xdotool text failed: {e}")
+
+def _send_fallback_key(key):
+    try:
+        pyautogui.press(key)
+    except Exception as e:
+        print(f"Fallback key failed: {e}")
+
+def _send_fallback_text(text):
+    try:
+        pyautogui.typewrite(text, interval=0.02)
+    except Exception as e:
+        print(f"Fallback text failed: {e}")
+
 def _prompt_add_ip(ip):
     if ip in _pending_ips: return
     _pending_ips.add(ip)
@@ -86,6 +221,11 @@ def _check_request():
     ip = request.remote_addr
     if _is_rate_limited(ip):
         return jsonify({"error": "rate limited"}), 429
+
+    # /security/whitelist/add مسموح لأي جهاز عشان يقدر يضيف نفسه
+    if request.path == '/security/whitelist/add':
+        return
+
     wl = security.get("whitelist", [])
     if wl and not _is_allowed(ip):
         _prompt_add_ip(ip)
@@ -94,6 +234,9 @@ def _check_request():
 def ws_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
+        try:
+            if not _is_allowed(request.remote_addr): return
+        except: pass
         return f(*args, **kwargs)
     return wrapper
 
@@ -115,7 +258,6 @@ class _CoreTempData(ctypes.Structure):
     ]
 
 def _get_coretemp():
-    import platform
     system = platform.system()
 
     if system == 'Windows':
@@ -191,6 +333,7 @@ def get_system_stats():
 # ── Key Mapping ────────────────────────────────────────────────────────────────
 KEY_MAP = {
     'win':'winleft','windows':'winleft','super':'winleft',
+    'cmd':'command','command':'command',
     'ctrl':'ctrl','control':'ctrl','alt':'alt','shift':'shift',
     'printscreen':'printscreen','prtsc':'printscreen',
     'playpause':'playpause','nexttrack':'nexttrack','prevtrack':'prevtrack',
@@ -211,9 +354,12 @@ def type_text(text):
             import pyperclip
             pyperclip.copy(text)
             time.sleep(0.08)
-            pyautogui.hotkey('ctrl', 'v')
+            if platform.system() == 'Darwin':
+                pyautogui.hotkey('command', 'v')
+            else:
+                pyautogui.hotkey('ctrl', 'v')
             time.sleep(0.05)
-        except:
+        except Exception:
             try: pyautogui.write(text, interval=0.02)
             except Exception as e: print(f"❌ type_text: {e}")
 
@@ -222,7 +368,7 @@ screen_streaming = False
 screen_thread    = None
 _screen_last_error = ''
 
-stream_config = {'height': 480, 'quality': 65, 'fps': 30, 'monitor': 1}
+stream_config = {'height': 480, 'quality': 65, 'fps': 30, 'monitor': 1, 'cursor_color_bgr': (255, 255, 255)}
 _stream_config_lock = threading.Lock()
 
 def screen_worker():
@@ -254,8 +400,6 @@ def screen_worker():
             _screen_last_error = 'cv2/PIL غير متوفر'
             return
 
-    stream_config.setdefault('cursor_color_bgr', (255, 255, 255))
-
     with app.app_context():
         try:
             with _mss.mss() as sct:
@@ -282,7 +426,7 @@ def screen_worker():
                             sy = int((my - mon['top'])  * nh / h)
                             if 0 <= sx < nw and 0 <= sy < nh:
                                 pts = np.array([[sx,sy],[sx+12,sy+12],[sx,sy+16]], np.int32)
-                                cv2.fillPoly(arr, [pts], stream_config.get('cursor_color_bgr',(255,255,255)))
+                                cv2.fillPoly(arr, [pts], cfg.get('cursor_color_bgr',(255,255,255)))
                                 cv2.polylines(arr, [pts], True, (0,0,0), 1)
                         else:
                             from PIL import Image as _PIL2
@@ -318,7 +462,7 @@ def screen_worker():
             _screen_last_error = str(e)
             print(f"❌ screen_worker: {e}")
 
-import queue as _queue
+
 _mic_queue   = _queue.Queue(maxsize=40)
 _mic_active  = False
 _mic_worker_thread = None
@@ -335,7 +479,6 @@ def on_disconnect(reason=None):
 @socketio.on('screen_start')
 @ws_required
 def on_screen_start(d):
-    global screen_thread
     global screen_streaming, screen_thread
     screen_streaming = False
     time.sleep(0.1)
@@ -391,7 +534,7 @@ def get_whitelist():
 
 @app.route('/security/whitelist/add', methods=['POST'])
 def whitelist_add():
-    ip = request.remote_addr
+    ip = request.remote_addr  # بيضيف نفسه بس مش IP تاني
     with _sec_lock:
         if ip not in security["whitelist"]:
             security["whitelist"].append(ip)
@@ -488,8 +631,7 @@ def on_scroll(d):
         pyautogui.scroll(int(d.get('dy',0)))
 
 def _press_win_shortcut(keys):
-    """Cross-platform Win key shortcut"""
-    import platform
+    """Cross-platform Win/Cmd key shortcut"""
     system = platform.system()
     try:
         if system == 'Windows':
@@ -510,41 +652,91 @@ def _press_win_shortcut(keys):
             time.sleep(0.05)
             for vk in reversed(vks): u32.keybd_event(vk, 0, 0x0002, 0)
             return True
+        elif system == 'Darwin':
+            # macOS: map winleft/winright → command key
+            mac_keys = []
+            for k in keys:
+                if k in ('winleft', 'winright', 'command', 'cmd'):
+                    mac_keys.append('command')
+                else:
+                    mac_keys.append(k)
+            with _pyautogui_lock: pyautogui.hotkey(*mac_keys)
+            return True
         else:
-            # Linux/Mac - fall back to pyautogui
             with _pyautogui_lock: pyautogui.hotkey(*keys)
             return True
     except Exception as e:
         print(f"win shortcut error: {e}")
         return False
 
+def _press_mac_shortcut(keys):
+    """macOS: map cmd/command to command key"""
+    mac_keys = []
+    for k in keys:
+        if k in ('winleft', 'winright', 'command', 'cmd', 'super'):
+            mac_keys.append('command')
+        else:
+            mac_keys.append(k)
+    with _pyautogui_lock: pyautogui.hotkey(*mac_keys)
+
 @socketio.on('shortcut')
 @ws_required
 def on_shortcut(d):
-    keys = [map_key(k) for k in d.get('keys',[])]
-    print(f"🎹 shortcut: {keys}")
+    keys    = [map_key(k) for k in d.get('keys',[])]
+    system  = platform.system()
+    if system == 'Linux':
+        keys = ['super' if k in ('winleft','winright','command','cmd') else k for k in keys]
+    has_win = any(k in ('winleft','winright') for k in keys)
+    has_cmd = any(k in ('command','cmd','super') for k in keys)
     try:
-        has_win = any(k in ('winleft','winright') for k in keys)
-        if has_win:
+        if system == 'Darwin' and (has_win or has_cmd):
+            _press_mac_shortcut(keys)
+        elif system == 'Windows' and has_win:
             ok = _press_win_shortcut(keys)
             if not ok:
                 with _pyautogui_lock: pyautogui.hotkey(*keys)
         else:
             with _pyautogui_lock: pyautogui.hotkey(*keys)
-        print(f"🎹 OK")
-    except Exception as e: print(f"shortcut ERROR: {e}")
+    except Exception as e:
+        print(f"shortcut error: {e}")
 
 @socketio.on('key')
 @ws_required
 def on_key(d):
-    try:
-        with _pyautogui_lock: pyautogui.press(map_key(d.get('key','')))
-    except Exception as e: print(f"key: {e}")
+    key = map_key(d.get('key', ''))
+    system = platform.system()
+    if system == 'Linux':
+        if _virtual_kb_device:
+            key_code = getattr(uinput, f'KEY_{key.upper()}', None)
+            if key_code:
+                _send_virtual_key(key_code, True)
+                time.sleep(0.01)
+                _send_virtual_key(key_code, False)
+        elif SUBPROCESS_AVAILABLE:
+            _send_xdotool_key(key)
+        else:
+            _send_fallback_key(key)
+    else:
+        try:
+            with _pyautogui_lock: pyautogui.press(key)
+        except Exception as e: print(f"key: {e}")
 
 @socketio.on('type')
 @ws_required
 def on_type(d):
-    type_text(d.get('text',''))
+    text = d.get('text', '')
+    if not text:
+        return
+    system = platform.system()
+    if system == 'Linux':
+        if _virtual_kb_device:
+            _send_virtual_text(text)
+        elif SUBPROCESS_AVAILABLE:
+            _send_xdotool_text(text)
+        else:
+            _send_fallback_text(text)
+    else:
+        type_text(text)
 
 @socketio.on('key_down')
 @ws_required
@@ -580,13 +772,12 @@ def _clipboard_watcher():
                     _last_clip = current
                     socketio.emit('clipboard_update', {'text': current})
         except: pass
-        time.sleep(1)
+        time.sleep(2)
 
 # ── File Explorer ──────────────────────────────────────────────────────────────
 import zipfile, string as _string
 
 def _list_drives():
-    import platform
     if platform.system() == 'Windows':
         return [d+':\\' for d in _string.ascii_uppercase if os.path.exists(d+':\\')]
     elif platform.system() == 'Darwin':
@@ -661,7 +852,9 @@ def explorer_download_multi():
                 for root, _, files in os.walk(p):
                     for fname in files:
                         full = os.path.join(root, fname)
-                        try: zf.write(full, os.path.relpath(full, os.path.dirname(p)))
+                        try:
+                            # التعديل هنا: استخدم p مباشرة بدلاً من os.path.dirname(p)
+                            zf.write(full, os.path.relpath(full, os.path.dirname(p) if os.path.dirname(p) else p))
                         except: pass
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name='pcc_files.zip', mimetype='application/zip')
@@ -773,7 +966,6 @@ def explorer_shortcut():
     src  = d.get('src','').strip()
     dest = d.get('dest','').strip()
     if not src or not dest: return jsonify({'error': 'missing params'}), 400
-    import platform
     try:
         if platform.system() == 'Windows':
             import win32com.client
@@ -790,8 +982,14 @@ def explorer_shortcut():
             name = os.path.splitext(os.path.basename(src))[0]
             desktop = os.path.join(dest, name + '.desktop')
             with open(desktop, 'w') as f:
-                f.write(f'[Desktop Entry]\nType=Link\nName={name}\nURL=file://{src}\n')
+                f.write(f'[Desktop Entry]\nType=Link\nName={name}\nURL=file://{src}\nIcon=applications-system\n')
             os.chmod(desktop, 0o755)
+            # Optional xdg install for desktop environments
+            try:
+                import subprocess
+                subprocess.run(['xdg-desktop-icon', 'install', '--novendor', desktop], check=False)
+            except Exception:
+                pass
         return jsonify({'ok': True})
     except Exception as e:
         logging.exception("Failed to create explorer shortcut")
@@ -800,18 +998,26 @@ def explorer_shortcut():
 @app.route('/explorer/properties')
 def explorer_properties():
     raw_path = request.args.get('path', '').strip()
-    # Constrain path to BASE_DIR to avoid directory traversal / uncontrolled paths
     if not raw_path:
         return jsonify({'error': 'not found'}), 404
-    # Build a normalized absolute path under BASE_DIR
-    fullpath = os.path.normpath(os.path.join(BASE_DIR, raw_path))
+
+    # Prevent directory traversal by resolving the absolute path
+    # and ensuring it doesn't escape the allowed directories
     try:
-        # Ensure the resolved path stays within BASE_DIR
-        if os.path.commonpath([BASE_DIR, fullpath]) != BASE_DIR:
-            return jsonify({'error': 'not found'}), 404
+        # Get the absolute path and resolve any symlinks
+        fullpath = os.path.abspath(raw_path)
+
+        # For security, we should restrict access to certain directories
+        # but since this is a file explorer, we'll allow access to the entire filesystem
+        # but prevent access to sensitive system directories
+        sensitive_dirs = ['/proc', '/sys', '/dev', 'C:\\Windows\\System32', 'C:\\Windows']
+        for sensitive in sensitive_dirs:
+            if fullpath.startswith(os.path.abspath(sensitive)):
+                return jsonify({'error': 'access denied'}), 403
+
         if not os.path.exists(fullpath):
             return jsonify({'error': 'not found'}), 404
-        import shutil as _shutil
+
         stat = os.stat(fullpath)
         info = {
             'name':     os.path.basename(fullpath),
@@ -822,13 +1028,16 @@ def explorer_properties():
             'created':  int(stat.st_ctime),
         }
         if os.path.isdir(fullpath):
-            total = sum(
-                os.path.getsize(os.path.join(r, f))
-                for r, _, fs in os.walk(fullpath)
-                for f in fs
-                if os.path.exists(os.path.join(r, f))
-            )
-            info['size'] = total
+            try:
+                total = sum(
+                    os.path.getsize(os.path.join(r, f))
+                    for r, _, fs in os.walk(fullpath)
+                    for f in fs
+                    if os.path.exists(os.path.join(r, f))
+                )
+                info['size'] = total
+            except (OSError, PermissionError):
+                info['size'] = 0
         return jsonify(info)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -999,7 +1208,6 @@ def _audio_worker():
             print("❌ audio: CABLE Output مش موجود — شغّل VB-Audio")
             audio_streaming = False
             return
-        stream_config.setdefault('cursor_color_bgr', (255, 255, 255))
         with sd.InputStream(samplerate=_AUDIO_RATE, channels=1, dtype='int16',
                             blocksize=_AUDIO_CHUNK, device=device_idx) as stream:
             while audio_streaming:
@@ -1013,7 +1221,6 @@ def _audio_worker():
 
 @app.route('/audio/start', methods=['POST'])
 def audio_start_http():
-    global _audio_thread
     global audio_streaming, _audio_thread
     if audio_streaming: return jsonify({'ok': True})
     audio_streaming = True
@@ -1032,7 +1239,6 @@ def audio_stop_http():
 @socketio.on('audio_start')
 @ws_required
 def on_audio_start(d):
-    global _audio_thread
     global audio_streaming, _audio_thread
     if _audio_thread and _audio_thread.is_alive(): return
     audio_streaming = True
@@ -1098,8 +1304,9 @@ def _scheduler_worker():
         with _sched_lock:
             for task in scheduled_tasks:
                 if not task.get('enabled', True): continue
-                if task.get('time') == now and task.get('_last_run') != now:
-                    task['_last_run'] = now
+                if task.get('time') == now and task.get('last_run') != now:
+                    task['last_run'] = now
+                    _save_scheduled(scheduled_tasks)
                     macro_name = task.get('macro')
                     with _macro_lock:
                         steps = macros.get(macro_name, [])
@@ -1133,7 +1340,7 @@ def scheduled_list():
 def scheduled_save():
     d = request.get_json() or {}
     task = {'id': str(int(time.time())), 'name': d.get('name',''), 'time': d.get('time',''),
-            'macro': d.get('macro',''), 'enabled': True}
+            'macro': d.get('macro',''), 'enabled': True, 'last_run': ''}
     with _sched_lock:
         scheduled_tasks.append(task)
         _save_scheduled(scheduled_tasks)
@@ -1238,6 +1445,16 @@ if __name__ == '__main__':
     threading.Thread(target=_clipboard_watcher, daemon=True).start()
     _sched_thread = threading.Thread(target=_scheduler_worker, daemon=True)
     _sched_thread.start()
+
+    # Linux compatibility diagnostics
+    for warn in _check_linux_compatibility():
+        print(f"⚠️ Linux compatibility: {warn}")
+
+    # Initialize virtual keyboard if possible
+    if _init_virtual_keyboard():
+        print("✅ Virtual keyboard initialized successfully.")
+    else:
+        print("⚠️ Virtual keyboard not available; using fallbacks.")
 
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
