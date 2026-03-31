@@ -1,18 +1,81 @@
-# PortDesk Keyboard Input Solutions Notes
+# PortDesk — Notes & Documentation
+
+---
 
 ## Quick Fix (Priority 1)
-- إذا الكيبورد بشكل عام في PortDesk لا يستجيب، جرب تشغيل السيرفر من ملف التشغيل الخاص (start_portdesk.bat) أو تشغيله بشكل مخفي/minimized.
-- في ويندوز: افتح `start_portdesk.bat` (مُعد لـ `start /min python "portdesk-server.py"`). هذه الطريقة تحل مشكلة focus/input في الأغلب.
-- في لينكس وماك: استخدم السكربتات `start_portdesk_linux.sh` أو `start_portdesk_mac.sh` (أدناه) لتشغيل السيرفر في الخلفية.
+- If the keyboard in PortDesk does not respond in general, try running the server from the dedicated launch file (start_portdesk.bat) or running it minimized/hidden.
+- On Windows: Open `start_portdesk.bat` (configured for `start /min python "portdesk-server.py"`). This method resolves focus/input issues in most cases.
+- On Linux and Mac: Use the scripts `start_portdesk_linux.sh` or `start_portdesk_mac.sh` (see below) to run the server in the background.
+
+---
 
 ## Overview
 This document explains the keyboard input handling solutions implemented in PortDesk to address issues where mobile keyboard input reaches the server but doesn't display on the target system (e.g., Windows, Linux). The solutions provide layered fallbacks for reliability across different environments.
+
+---
 
 ## Problem Description
 - Mobile keyboard input is sent to the server successfully.
 - Server cursor responds (indicating input reception).
 - But characters don't appear on screen intermittently.
 - Issue occurs due to focus, window state, input method, or environment differences.
+
+---
+
+## PIN Security — Brute Force Protection
+
+PortDesk implements an escalating lockout system to protect against brute force PIN attempts:
+
+- You have **5 attempts** before a lockout is triggered.
+- **1st lockout**: 60 seconds (1 minute).
+- **2nd lockout**: 180 seconds (3 minutes).
+- **3rd lockout and beyond**: 300 seconds (5 minutes) — permanently fixed at this duration.
+- Lockout counters are tracked per IP address and persist as long as the server is running.
+- A successful login resets the attempt counter for that IP.
+
+> **Note:** During a lockout period, all PIN input buttons are disabled on the client side. The client cannot bypass the lockout even if the correct PIN is entered.
+
+---
+
+## Whitelist & Blacklist — Network Security
+
+PortDesk uses a command-line approval system to control which devices can connect:
+
+### Whitelist
+- When a new device attempts to connect, a prompt appears in the server console asking: **"Add to whitelist? (y/n)"**
+- If approved (`y`): the device is saved to the whitelist and can connect freely.
+- If rejected (`n`): the device is denied access. The attempt counter increments.
+
+### Auto-Blacklist
+- If the same device is **rejected 3 times** from the server console, it is automatically added to the **blacklist**.
+- Blacklisted devices are permanently blocked — no prompt is shown, no access is granted.
+- The server console will display: `⛔ Device added to blacklist after 3 rejections`.
+
+### Removing a Device from the Blacklist
+- The server owner can remove a device from the blacklist manually (localhost only via `/security/blacklist/remove`).
+- After removal, the device goes back to the normal approval flow (y/n prompt) — the rejection counter resets.
+- Re-approval is still required even after blacklist removal.
+
+### Client-Side
+- An approved device can view its own whitelist status in the Settings tab.
+- A device can remove **itself** from the whitelist from Settings — but cannot remove other devices.
+- No client has the ability to clear or modify the full whitelist or blacklist.
+
+---
+
+## Known Issues in Current Version
+
+The following issues are known and may be encountered in the current release. Please follow the latest updates on GitHub for fixes:
+
+- **WebSocket on Python 3.14**: Flask-SocketIO does not work correctly with Werkzeug on Python 3.14. It is recommended to use **Python 3.11 or 3.12**.
+- **Screen streaming sharpness**: Quality may vary between devices depending on screen DPR (Device Pixel Ratio). This is partially addressed in the current version but may still vary.
+- **Keyboard input on some Windows setups**: May require running the server as Administrator.
+- **Gyroscope control**: Requires HTTPS to be enabled (run `gen_cert.py` first).
+- **Mobile microphone**: Only works over HTTPS.
+
+> For the latest fixes and updates, always check: **https://github.com/Lucky-abdo/PortDesk**
+
+---
 
 ## Windows-Specific Issues and Solutions
 
@@ -41,13 +104,15 @@ This document explains the keyboard input handling solutions implemented in Port
 5. Test with simple text first, then shortcuts.
 6. Verify that the Python environment has access to user input devices.
 
+---
+
 ## macOS-Specific Issues and Solutions
 
 ### Potential Problems:
-- **Accessibility Permissions**: macOS requires explicit accessibility permissions for applications to simulate input, which PortDesk may not have by default.
-- **Focus and Window Management**: Input may fail if the target application is not active or if macOS security features intervene.
+- **Accessibility Permissions**: macOS requires explicit accessibility permissions for applications to simulate input.
+- **Focus and Window Management**: Input may fail if the target application is not active.
 - **Gatekeeper Restrictions**: Unsigned or unnotarized applications might be blocked from simulating input.
-- **Key Mapping Differences**: Windows-style shortcuts (e.g., Ctrl+C) need to be mapped to macOS equivalents (e.g., Cmd+C).
+- **Key Mapping Differences**: Windows-style shortcuts need to be mapped to macOS equivalents.
 - **SIP (System Integrity Protection)**: May restrict certain system-level input simulations.
 
 ### Solutions Implemented:
@@ -61,7 +126,7 @@ This document explains the keyboard input handling solutions implemented in Port
 - Accessibility permissions enabled for the Python/Terminal application running PortDesk.
 
 ### Troubleshooting Steps:
-1. Enable Accessibility permissions: Go to System Preferences > Security & Privacy > Privacy > Accessibility, and add/check Terminal or Python.
+1. Enable Accessibility permissions: System Preferences > Security & Privacy > Privacy > Accessibility.
 2. Restart the PortDesk server after granting permissions.
 3. Ensure the target application is in focus.
 4. Test with simple text input first.
@@ -69,17 +134,19 @@ This document explains the keyboard input handling solutions implemented in Port
 6. If using a virtual environment, ensure the Python executable has permissions.
 7. For Gatekeeper issues, right-click the script and select "Open" to bypass restrictions.
 
+---
+
 ## Linux-Specific Issues and Solutions
 
 ### Potential Problems:
-- **Root Access for uinput**: Virtual keyboard requires root privileges, which may not be available.
-- **Wayland Compatibility**: xdotool doesn't work on Wayland, limiting fallback options.
+- **Root Access for uinput**: Virtual keyboard requires root privileges.
+- **Wayland Compatibility**: xdotool doesn't work on Wayland.
 - **Missing Dependencies**: uinput or xdotool packages may not be installed.
 - **Headless Environments**: No GUI means input simulation fails.
 - **Environment Variables**: DISPLAY or WAYLAND_DISPLAY not set properly.
 
 ### Solutions Implemented:
-1. **Virtual Keyboard Device (Primary)**: Uses uinput to create kernel-level input device for direct keystroke injection.
+1. **Virtual Keyboard Device (Primary)**: Uses uinput to create kernel-level input device.
 2. **xdotool Fallback (Secondary)**: Command-line tool for X11-based input simulation.
 3. **pyautogui Fallback (Tertiary)**: Cross-platform library as final backup.
 
@@ -99,4 +166,53 @@ This document explains the keyboard input handling solutions implemented in Port
 5. Check if running in headless mode.
 6. For Wayland: Use XWayland if available, or rely on uinput/pyautogui.
 
+---
+---
+<div dir="rtl">
 
+ملاحظات بالعربي
+إصلاح سريع (الأولوية الأولى)
+إذا كان الكيبورد في PortDesk لا يستجيب بشكل عام، جرب تشغيل السيرفر من ملف التشغيل الخاص (start_portdesk.bat) أو تشغيله بشكل مخفي/minimized.
+
+في ويندوز: افتح start_portdesk.bat (مُعد لـ start /min python "portdesk-server.py"). هذه الطريقة تحل مشكلة focus/input في الأغلب.
+
+في لينكس وماك: استخدم السكربتات start_portdesk_linux.sh أو start_portdesk_mac.sh لتشغيل السيرفر في الخلفية.
+
+أمان PIN — الحماية من محاولات التخمين
+عندك 5 محاولات قبل ما يتم القفل.
+
+القفل الأول: 60 ثانية.
+
+القفل الثاني: 180 ثانية (3 دقايق).
+
+القفل الثالث وما بعده: 300 ثانية (5 دقايق) — ثابت.
+
+أثناء القفل، أزرار الـ PIN بتتعطل على الكلايانت ومفيش طريقة للتحايل حتى لو الـ PIN صح.
+
+القايمة البيضا والسودا — أمان الشبكة
+لما جهاز جديد يحاول يتصل، بيظهر في الكوماند سؤال: "تضيفه للقايمة البيضا؟ (y/n)"
+
+لو وافقت (y): الجهاز بيتحفظ ويقدر يتصل.
+
+لو رفضت (n): الجهاز ممنوع. العداد بيزيد.
+
+لو نفس الجهاز اترفض 3 مرات: بيتضاف للقايمة السودا تلقائياً ويتحظر نهائياً.
+
+صاحب السيرفر يقدر يشيل الجهاز من القايمة السودا، بس لازم يوافق عليه تاني من الكوماند.
+
+الكلايانت يقدر يشيل نفسه بس من القايمة البيضا من الإعدادات — ومينفعش يعدل القايمة البيضا أو السودا.
+
+مشاكل معروفة في النسخة الحالية
+WebSocket على Python 3.14: مش شغال صح. استخدم Python 3.11 أو 3.12.
+
+جودة البث: ممكن تختلف بين الأجهزة حسب الـ DPR.
+
+الكيبورد على بعض إعدادات Windows: ممكن يحتاج تشغيل السيرفر كـ Administrator.
+
+التحكم بالجيروسكوب: يحتاج HTTPS مفعّل.
+
+ميكروفون الموبايل: يشتغل بس على HTTPS.
+
+لمتابعة آخر التحديثات والإصلاحات: https://github.com/Lucky-abdo/PortDesk
+
+</div>
