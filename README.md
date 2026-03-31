@@ -4,7 +4,7 @@
 
 **Control your PC from any device browser. No app needed.**
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 
@@ -15,7 +15,7 @@
 ## ⚠️ Official Source
 
 **The only official and verified release of PortDesk is hosted at:**  
-👉 `https://github.com/Lucky_abdo/PortDesk`
+👉 `https://github.com/Lucky-abdo/PortDesk`
 
 Copies or forks obtained from third-party websites, messaging groups, or unofficial links may have been modified. We cannot guarantee that such versions retain the same privacy standards, security model, or integrity as the original. Please exercise caution and always verify the source before running any code on your machine.
 
@@ -31,16 +31,11 @@ Everything runs **locally on your machine**. Nothing is sent to the internet. Ev
 
 ## Quick Start
 
-### 1. System Requirements:
+### 1. Install dependencies
 
-Python: 3.8 or higher.
-
-OS: Windows 7+ / Linux (Ubuntu, antiX, Debian).
-
-macOS: Version 10.14 (Mojave) or later.
-
-Installation:  pip install -r requirements.txt
-
+```bash
+pip install flask flask-socketio pyautogui opencv-python mss psutil pyperclip sounddevice numpy Pillow cryptography
+```
 
 ### 2. Run the server
 
@@ -57,8 +52,6 @@ You'll see something like:
   [WiFi] http://192.168.1.x:5000
 ══════════════════════════════════════════════════
 ```
-
-## **Make sure** that you are using the main wifi network. guest or data network wont work with wifi mode
 
 ### 3. Open on any device
 
@@ -224,21 +217,7 @@ Two views:
 
 ---
 
-## 🐛 Debug Console
-
-The **`PortDesk v1.0 🐞`** logo in the top-left corner is a button.  
-Tap it to open the debug console which shows:
-- All socket events being sent
-- Connection status and socket ID
-- Any JavaScript errors
-- Timing information
-
-Use the **Client** tab in the Log panel for a formatted view of the same data.  
-This is not just a logo — it is a live diagnostic tool.
-
----
-
-## 🔒 Security & Whitelist
+##  Security & Whitelist
 
 PortDesk is designed for local network use only. It has a built-in IP whitelist system.
 
@@ -249,14 +228,16 @@ PortDesk is designed for local network use only. It has a built-in IP whitelist 
 - Whitelisted devices connect automatically in the future
 
 **Manage the whitelist from the phone:**
-- Settings → Add this device to whitelist (adds current phone)
-- Settings → Clear whitelist (reset — all devices must re-request access)
+- Settings → Add this device to whitelist (sends approval request to server console)
+- Settings → Remove myself from whitelist (removes only your own device)
+- A device rejected 3 times from the server console is automatically blacklisted
+- The server owner can remove a device from the blacklist via localhost only
 
 **PIN Lock:**
 - Settings → Set PIN — set a 4-digit PIN
 - Anyone opening the URL must enter it before accessing the controller
 - PIN is stored as a salted SHA-256 hash in the browser, never sent to the server in plain text
-- After 5 wrong attempts, the server locks the IP for 60 seconds
+- After 5 wrong attempts, the server locks the IP with an escalating lockout: 60 seconds on the 1st lockout, 180 seconds on the 2nd, and 300 seconds (fixed) from the 3rd onward
 
 ---
 
@@ -295,6 +276,8 @@ Uses your device's microphone as a virtual mic on the PC.
 ## Known Limitations
 
 - Screen mirroring FPS depends on your network speed and PC performance
+- Install `pyturbojpeg` for significantly better screen streaming performance: `pip install pyturbojpeg`
+- **Python 3.14 is not supported** — use Python 3.11 or 3.12
 - Mobile microphone requires HTTPS (generate a certificate first)
 - Remote audio on macOS has limited support
 - Gyroscope on iOS requires user permission (browser will ask on first use)
@@ -310,7 +293,7 @@ Uses your device's microphone as a virtual mic on the PC.
 | `portdesk_client.html` | The phone UI — served automatically by the server |
 | `gen_cert.py` | Generates self-signed SSL certificate for HTTPS |
 | `requirements.txt` | Python dependencies |
-| `portdesk_security.json` | Whitelist (auto-created, not in repo) |
+| `portdesk_security.json` | Whitelist & blacklist (auto-created, not in repo) |
 | `portdesk_macros.json` | Saved macros (auto-created) |
 | `portdesk_scheduled.json` | Scheduled tasks (auto-created) |
 | `portdesk_events.log` | Server event log (auto-created) |
@@ -323,6 +306,6 @@ MIT License — see [LICENSE](LICENSE)
 
 ---
 
-## notes
+## A note on development
 
---PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
+PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
