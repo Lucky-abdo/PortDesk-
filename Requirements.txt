@@ -1,5 +1,6 @@
 flask>=2.0.0
 flask-socketio>=5.0.0
+simple-websocket>=1.0.0
 pyautogui>=0.9.53
 opencv-python>=4.5.0
 mss>=6.0.0
