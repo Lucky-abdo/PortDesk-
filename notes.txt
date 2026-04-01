@@ -2,15 +2,15 @@
 
 ---
 
+## Overview
+covering security mechanisms (PIN protection, whitelist/blacklist), known issues and their workarounds, platform-specific behavior and requirements (Windows, macOS, Linux), and screen streaming performance characteristics.
+
+---
+
 ## Quick Fix (Priority 1)
 - If the keyboard in PortDesk does not respond in general, try running the server from the dedicated launch file (start_portdesk.bat) or running it minimized/hidden.
 - On Windows: Open `start_portdesk.bat` (configured for `start /min python "portdesk-server.py"`). This method resolves focus/input issues in most cases.
 - On Linux and Mac: Use the scripts `start_portdesk_linux.sh` or `start_portdesk_mac.sh` (see below) to run the server in the background.
-
----
-
-## Overview
-This document explains the keyboard input handling solutions implemented in PortDesk to address issues where mobile keyboard input reaches the server but doesn't display on the target system (e.g., Windows, Linux). The solutions provide layered fallbacks for reliability across different environments.
 
 ---
 
@@ -68,12 +68,42 @@ PortDesk uses a command-line approval system to control which devices can connec
 The following issues are known and may be encountered in the current release. Please follow the latest updates on GitHub for fixes:
 
 - **WebSocket on Python 3.14**: Flask-SocketIO does not work correctly with Werkzeug on Python 3.14. It is recommended to use **Python 3.11 or 3.12**.
-- **Screen streaming sharpness**: Quality may vary between devices depending on screen DPR (Device Pixel Ratio). This is partially addressed in the current version but may still vary.
+- **Screen streaming sharpness**: Quality may vary between devices depending on screen DPR (Device Pixel Ratio) and the client browser's rendering capabilities. This is partially addressed in the current version but may still vary.
 - **Keyboard input on some Windows setups**: May require running the server as Administrator.
 - **Gyroscope control**: Requires HTTPS to be enabled (run `gen_cert.py` first).
 - **Mobile microphone**: Only works over HTTPS.
 
 > For the latest fixes and updates, always check: **https://github.com/Lucky-abdo/PortDesk**
+
+---
+
+## Screen Streaming — Performance & Latency
+
+### Streaming Quality
+The visual quality of the stream can differ across client devices even with identical server settings. This is influenced by:
+- **Client screen DPR (Device Pixel Ratio)**: High-DPR screens (e.g., Retina displays) may scale the stream differently, affecting perceived sharpness.
+- **Browser rendering engine**: Different browsers handle JPEG decoding and canvas rendering at different speeds and quality levels.
+- **Client screen resolution**: A lower-resolution client screen may display the stream with visible compression artifacts.
+
+### Streaming Ping (Frame Latency)
+The delay between what happens on the server and what appears on the client depends on several factors:
+
+- **Frame capture time**: How fast the server can capture a screenshot of the desktop.
+- **JPEG encoding (server-side)**: The time taken to compress the frame. This is directly tied to the **server CPU performance** — a weaker CPU will produce higher latency.
+- **Network transfer time**: The time the compressed frame takes to travel over the network. Affected by **WiFi signal strength, bandwidth, and interference**.
+- **JPEG decoding (client-side)**: The time the client browser takes to decompress and render the frame.
+- **JPEG quality setting**: Higher quality = larger frame size = more transfer and decode time.
+
+> **In short**: Streaming ping is a chain — server CPU → network → client rendering. A bottleneck in any part of this chain increases total latency.
+
+### Connection Ping (Server Responsiveness)
+The ping between the client and the PortDesk server (e.g., for mouse/keyboard commands) is affected by:
+
+- **Network type**: LAN (same WiFi/router) gives significantly lower ping than WAN (over the internet or mobile data).
+- **WiFi quality**: Distance from the router, interference, and congestion all increase ping.
+- **Router latency**: Some routers introduce additional latency for local traffic routing.
+- **Server load**: High CPU usage on the server machine increases response time for all incoming requests.
+- **WebSocket overhead**: The WebSocket protocol has minimal overhead, but a busy event loop on the server can delay message handling.
 
 ---
 
@@ -205,7 +235,7 @@ The following issues are known and may be encountered in the current release. Pl
 مشاكل معروفة في النسخة الحالية
 WebSocket على Python 3.14: مش شغال صح. استخدم Python 3.11 أو 3.12.
 
-جودة البث: ممكن تختلف بين الأجهزة حسب الـ DPR.
+جودة البث: ممكن تختلف بين الأجهزة حسب الـ DPR وقدرة المتصفح على الرندرة. حتى لو إعدادات السيرفر واحدة، الجودة ممكن تتفاوت من جهاز للتاني.
 
 الكيبورد على بعض إعدادات Windows: ممكن يحتاج تشغيل السيرفر كـ Administrator.
 
@@ -214,5 +244,35 @@ WebSocket على Python 3.14: مش شغال صح. استخدم Python 3.11 أو 
 ميكروفون الموبايل: يشتغل بس على HTTPS.
 
 لمتابعة آخر التحديثات والإصلاحات: https://github.com/Lucky-abdo/PortDesk
+
+---
+
+## بث الشاشة — الأداء والتأخير
+
+### جودة البث
+الجودة البصرية بتتأثر بعوامل على جانب الكلايانت:
+- **DPR بتاع شاشة الكلايانت**: الشاشات عالية الكثافة (زي Retina) ممكن تعرض البث بطريقة مختلفة وتأثر على الحدة.
+- **المتصفح**: كل متصفح بيفك ضغط الـ JPEG ويعرضه بسرعة وجودة مختلفة.
+- **دقة شاشة الكلايانت**: الشاشات المنخفضة الدقة ممكن تظهر ضغط واضح على الصورة.
+
+### بنج البث (تأخير الفريم)
+التأخير بين ما بيحصل على السيرفر وما بيظهر على الكلايانت بيعتمد على:
+
+- **وقت كابتشر الفريم**: سرعة السيرفر في التقاط لقطة الشاشة.
+- **تشفير JPEG (على السيرفر)**: وقت ضغط الفريم — مرتبط مباشرة بـ **CPU بتاع السيرفر**. كل ما الـ CPU أضعف، الـ latency أعلى.
+- **وقت نقل البيانات على الشبكة**: بيتأثر بـ **قوة الـ WiFi، الـ bandwidth، والتشويش**.
+- **فك تشفير JPEG (على الكلايانت)**: الوقت اللي المتصفح بياخده عشان يفك الضغط ويعرض الفريم.
+- **جودة الـ JPEG**: جودة أعلى = فريم أكبر = وقت نقل وفك ضغط أكتر.
+
+> **باختصار**: بنج البث هو سلسلة — CPU السيرفر ← الشبكة ← رندرة الكلايانت. أي نقطة ضعف في السلسلة دي بترفع الـ latency الكلي.
+
+### بنج الاتصال بالسيرفر
+التأخير بين الكلايانت والسيرفر (للأوامر زي الماوس والكيبورد) بيتأثر بـ:
+
+- **نوع الشبكة**: LAN (نفس الـ WiFi/راوتر) بيدي بنج أقل بكتير من WAN (إنترنت أو داتا موبايل).
+- **جودة الـ WiFi**: البُعد عن الراوتر، التشويش، وازدحام الشبكة كلها بترفع البنج.
+- **تأخير الراوتر**: بعض الراوترات بتضيف تأخير على ترافيك الـ LAN.
+- **حمل السيرفر**: لو الـ CPU على السيرفر مشغول، ده بيأثر على سرعة رد السيرفر على الطلبات الواردة.
+- **أوفرهيد الـ WebSocket**: الـ WebSocket نفسه خفيف، بس لو الـ event loop على السيرفر مزحوم ممكن يتأخر في معالجة الرسايل.
 
 </div>
