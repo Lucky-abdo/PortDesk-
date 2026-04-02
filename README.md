@@ -21,6 +21,13 @@ Copies or forks obtained from third-party websites, messaging groups, or unoffic
 
 ---
 
+### Lazy to read ?
+here is an prompt so ai concises it.
+
+```bash
+summary this file ,so i know how to install and run it and the important notices on the tool ,and no more than that
+```
+
 ## What is PortDesk?
 
 PortDesk turns any device into a full PC controller over your local network (WiFi or USB).  
@@ -31,13 +38,23 @@ Everything runs **locally on your machine**. Nothing is sent to the internet. Ev
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Install python
+(and adb but its optional)
+
+### 2. Install dependencies
 
 ```bash
 pip install flask flask-socketio pyautogui opencv-python mss psutil pyperclip sounddevice numpy Pillow cryptography
 ```
 
-### 2. Run the server
+### 3. Run the server 
+**better run it by start file
+** run gen cert so the server runs on https rather than http
+
+```bash
+python gen_cert.py     # generates cert.pem and key.pem
+python portdesk-server.py   # auto-detects the certificates and starts HTTPS
+```
 
 ```bash
 python portdesk-server.py
@@ -53,9 +70,10 @@ You'll see something like:
 ══════════════════════════════════════════════════
 ```
 
-### 3. Open on any device
+### 4. Open on any device
 
-- **WiFi:** Open `http://192.168.1.x:5000` in any browser on any device on the same network
+- **WiFi:** Open `http://192.168.1.x:5000` in any browser on any device on the same network and Accept warning in the browser if showen.
+
 - **USB (Android):** Run `adb reverse tcp:5000 tcp:5000` first, then open `http://localhost:5000`
 
 ---
@@ -64,11 +82,13 @@ You'll see something like:
 
 ### WiFi Mode
 - Connect your device and PC to the same WiFi network
+** make sure it's the main wifi network, not guest either data wifi
+  
 - Open the IP shown in the terminal on any browser
 - Works from phones, tablets, laptops, other PCs — anything with a browser
 - Slight latency possible over WiFi
 
-### USB Mode — Android (fastest, zero latency)
+### USB Mode — Android (fastest)
 Requires [ADB (Android Debug Bridge)](https://developer.android.com/tools/adb) installed on PC.
 
 ```bash
@@ -79,21 +99,8 @@ adb reverse tcp:5000 tcp:5000
 Then open `http://localhost:5000` on your device.
 
 > For non-Android devices (iPhone, iPad, laptop) just use WiFi mode — USB mode is Android-specific.  
-USB mode has near-zero latency and doesn't need WiFi.
 
----
-
-## HTTPS Setup (required for microphone)
-
-The mobile microphone feature requires a secure connection (HTTPS).
-
-```bash
-python gen_cert.py     # generates cert.pem and key.pem
-python portdesk-server.py   # auto-detects the certificates and starts HTTPS
-```
-
-Then use `https://` instead of `http://` when opening on your device.  
-Accept the self-signed certificate warning in the browser.
+**USB mode may occur some latency.
 
 ---
 
