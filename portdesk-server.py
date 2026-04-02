@@ -14,9 +14,10 @@ try:
     import numpy as np
     import cv2
     CV2_AVAILABLE = True
+    cv2.setNumThreads(2)
 except ImportError:
     np = None; cv2 = None; CV2_AVAILABLE = False
-import io, base64
+import base64
 import subprocess
 
 try:
@@ -35,10 +36,10 @@ except ImportError:
 
 SUBPROCESS_AVAILABLE = True
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SECURITY_FILE = os.path.join(BASE_DIR, "portdesk_security.json")
 
-app      = Flask(__name__)
+app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", logger=False, engineio_logger=False)
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
@@ -50,7 +51,7 @@ _sec_lock       = threading.Lock()
 def _load_security():
     try:
         with open(SECURITY_FILE) as f: return json.load(f)
-    except: return {"whitelist": []}
+    except: return {"whitelist": [], "blacklist": []}
 
 def _save_security():
     tmp = SECURITY_FILE + '.tmp'
@@ -58,7 +59,9 @@ def _save_security():
     os.replace(tmp, SECURITY_FILE)
 
 security    = _load_security()
-_req_counts = defaultdict(list)
+if "blacklist" not in security: security["blacklist"] = []
+_req_counts    = defaultdict(list)
+_reject_counts = defaultdict(int)   # IP → times rejected (resets if removed from blacklist)
 
 def _is_rate_limited(ip):
     now, window, limit = time.time(), 10, 50
@@ -70,8 +73,9 @@ def _is_rate_limited(ip):
 
 def _is_allowed(ip):
     if ip in ('127.0.0.1', '::1', 'localhost'): return True
+    if ip in security.get("blacklist", []): return False
     wl = security.get("whitelist", [])
-    return not wl or ip in wl
+    return ip in wl
 
 _pending_ips = set()
 
@@ -88,7 +92,7 @@ def _check_linux_compatibility():
 
     import shutil
     if not shutil.which('xclip') and not shutil.which('xsel'):
-        errors.append('xclip/xsel not installed; clipboard sync قد لا يعمل.')
+        errors.append('xclip/xsel not installed; clipboard sync may not work.')
     if not shutil.which('xdotool'):
         errors.append('xdotool not installed; virtual keyboard may be slower or unavailable on Linux.')
 
@@ -199,18 +203,29 @@ def _prompt_add_ip(ip):
     _pending_ips.add(ip)
     def ask():
         try:
-            print(f"\n{'═'*50}\n  🔔 طلب اتصال من: {ip}")
-            print("  تضيفه للقايمة البيضا؟ (y/n): ", end="", flush=True)
+            count = _reject_counts[ip] + 1
+            print(f"\n{'═'*50}\n  🔔 New connection request from: {ip}  (attempt {count}/3)")
+            print("  Add to whitelist? (y/n): ", end="", flush=True)
             if input().strip().lower() == 'y':
                 with _sec_lock:
                     if ip not in security["whitelist"]:
                         security["whitelist"].append(ip)
-                        _save_security()
-                print(f"  ✅ تم إضافة {ip}")
+                    _reject_counts[ip] = 0
+                    _save_security()
+                print(f"  ✅ Added {ip}")
             else:
-                print(f"  ✗ رفض {ip}")
+                _reject_counts[ip] += 1
+                if _reject_counts[ip] >= 3:
+                    with _sec_lock:
+                        if ip not in security["blacklist"]:
+                            security["blacklist"].append(ip)
+                            _save_security()
+                    print(f"  ⛔ {ip} added to blacklist after 3 rejections")
+                else:
+                    remaining = 3 - _reject_counts[ip]
+                    print(f"  ✗ Rejected {ip} — {remaining} attempt(s) remaining before blacklist")
         except Exception as e:
-            print(f"  ⚠ خطأ: {e}")
+            print(f"  ⚠ Error: {e}")
         finally:
             _pending_ips.discard(ip)
         print('═'*50)
@@ -222,12 +237,22 @@ def _check_request():
     if _is_rate_limited(ip):
         return jsonify({"error": "rate limited"}), 429
 
-    # /security/whitelist/add مسموح لأي جهاز عشان يقدر يضيف نفسه
-    if request.path == '/security/whitelist/add':
+    if ip in ('127.0.0.1', '::1', 'localhost'):
         return
 
-    wl = security.get("whitelist", [])
-    if wl and not _is_allowed(ip):
+    # blacklisted → permanent reject, no prompt
+    if ip in security.get("blacklist", []):
+        return jsonify({"error": "blacklisted"}), 403
+
+    # self-removal route: allowed if IP is in whitelist
+    if request.path == '/security/whitelist/remove_self':
+        return
+
+    # request-approval route: allowed always so client can ask
+    if request.path == '/security/whitelist/request':
+        return
+
+    if not _is_allowed(ip):
         _prompt_add_ip(ip)
         return jsonify({"error": "not whitelisted"}), 403
 
@@ -368,8 +393,32 @@ screen_streaming = False
 screen_thread    = None
 _screen_last_error = ''
 
-stream_config = {'height': 480, 'quality': 65, 'fps': 30, 'monitor': 1, 'cursor_color_bgr': (255, 255, 255)}
+stream_config = {
+    'height': 720,
+    'quality': 65,
+    'fps': 30,
+    'target_fps': 30,
+    'monitor': 1,
+    'cursor_color_bgr': (255, 255, 255)
+}
 _stream_config_lock = threading.Lock()
+
+# ── Mouse position cache (updated ~60hz by background thread) ──────────────────
+_mouse_pos      = (0, 0)
+_mouse_pos_lock = threading.Lock()
+
+def _mouse_tracker():
+    global _mouse_pos
+    while True:
+        try:
+            p = pyautogui.position()
+            with _mouse_pos_lock:
+                _mouse_pos = (p.x, p.y)
+        except Exception:
+            pass
+        time.sleep(0.016)
+
+threading.Thread(target=_mouse_tracker, daemon=True).start()
 
 def screen_worker():
     global screen_streaming, _screen_last_error
@@ -379,9 +428,12 @@ def screen_worker():
     pil_img_class = None
 
     try:
-        from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_420
+        from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_444 as _TJSAMP_444
         tj, use_turbo = TurboJPEG(), True
-    except: pass
+        _TJPF_BGR = TJPF_BGR
+        print("✅ screen: TurboJPEG active")
+    except Exception as _te:
+        print(f"⚠ screen: TurboJPEG not available ({_te}), falling back to cv2")
 
     if not use_turbo:
         try:
@@ -390,70 +442,122 @@ def screen_worker():
         except: pass
 
     if not MSS_AVAILABLE:
-        _screen_last_error = 'mss غير متوفر'
+        _screen_last_error = 'mss not available'
         return
 
     if not CV2_AVAILABLE and not use_turbo:
         try:
             from PIL import Image as _PIL2
         except ImportError:
-            _screen_last_error = 'cv2/PIL غير متوفر'
+            _screen_last_error = 'cv2/PIL not available'
             return
+
+    # maxsize=1 → always encode freshest frame, zero backlog
+    _pipe = _queue.Queue(maxsize=1)
+
+    fps_frames = 0
+    fps_t      = time.perf_counter()
+
+    def _encode_emit():
+        nonlocal fps_frames, fps_t
+        while screen_streaming:
+            try:
+                item = _pipe.get(timeout=0.1)
+                if item is None:
+                    break
+                arr, pil_obj, cfg_snap = item
+
+                quality = cfg_snap.get('quality', 65)
+
+                if arr is not None:
+                    if use_turbo:
+                        buf = tj.encode(arr, quality=quality, jpeg_subsample=_TJSAMP_444, pixel_format=_TJPF_BGR)
+                    elif CV2_AVAILABLE:
+                        _, enc = cv2.imencode('.jpg', arr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                        buf = enc.tobytes()
+                    elif pil_img_class:
+                        bio = io.BytesIO()
+                        pil_img_class.fromarray(arr[:, :, ::-1]).save(bio, format="JPEG", quality=quality, subsampling=0)
+                        buf = bio.getvalue()
+                    else:
+                        continue
+                else:
+                    bio = io.BytesIO()
+                    pil_obj.save(bio, format="JPEG", quality=quality, subsampling=0)
+                    buf = bio.getvalue()
+
+                socketio.emit('frame', {'data': buf, 'size': len(buf)})
+
+                fps_frames += 1
+                now = time.perf_counter()
+                if now - fps_t >= 1.0:
+                    real_fps = fps_frames / (now - fps_t)
+                    socketio.emit('fps_update', {'fps': round(real_fps, 1)})
+                    fps_frames = 0
+                    fps_t = now
+
+            except _queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ encode_emit: {e}")
+
+    emit_thread = threading.Thread(target=_encode_emit, daemon=True)
+    emit_thread.start()
 
     with app.app_context():
         try:
             with _mss.mss() as sct:
                 while screen_streaming:
                     try:
-                        t0  = time.time()
+                        t0 = time.perf_counter()
                         with _stream_config_lock: cfg = stream_config.copy()
-                        mon_idx  = min(cfg.get('monitor', 1), len(sct.monitors) - 1)
-                        mon      = sct.monitors[max(1, mon_idx)]
-                        target_h = cfg['height']
-                        quality  = cfg['quality']
-                        fps      = max(1, cfg['fps'])
+                        mon_idx      = min(cfg.get('monitor', 1), len(sct.monitors) - 1)
+                        mon          = sct.monitors[max(1, mon_idx)]
+                        target_h     = cfg['height']
+                        fps          = max(1, cfg['fps'])
+                        frame_budget = 1.0 / fps
 
                         img = sct.grab(mon)
 
                         if CV2_AVAILABLE:
-                            arr = np.asarray(img)
-                            arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+                            arr = np.frombuffer(img.raw, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
                             h, w = arr.shape[:2]
                             nw, nh = int(w * target_h / h), target_h
-                            arr = cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_LINEAR)
-                            mx, my = pyautogui.position()
+                            if h != nh:
+                                interp = cv2.INTER_AREA if nh < h else cv2.INTER_LINEAR
+                                arr = cv2.resize(arr, (nw, nh), interpolation=interp)
+                            else:
+                                arr = np.ascontiguousarray(arr)
+                            with _mouse_pos_lock:
+                                mx, my = _mouse_pos
                             sx = int((mx - mon['left']) * nw / w)
                             sy = int((my - mon['top'])  * nh / h)
                             if 0 <= sx < nw and 0 <= sy < nh:
-                                pts = np.array([[sx,sy],[sx+12,sy+12],[sx,sy+16]], np.int32)
-                                cv2.fillPoly(arr, [pts], cfg.get('cursor_color_bgr',(255,255,255)))
-                                cv2.polylines(arr, [pts], True, (0,0,0), 1)
+                                cursor_color = cfg.get('cursor_color_bgr', (255, 255, 255))
+                                pts = np.array([[sx, sy], [sx+12, sy+12], [sx, sy+16]], np.int32)
+                                cv2.fillPoly(arr, [pts], cursor_color)
+                                cv2.polylines(arr, [pts], True, (0, 0, 0), 1)
+                            pil_obj = None
                         else:
                             from PIL import Image as _PIL2
-                            pil = _PIL2.frombytes('RGB', (img.width, img.height), img.rgb)
+                            pil_obj = _PIL2.frombytes('RGB', (img.width, img.height), img.rgb)
                             h, w = img.height, img.width
                             nw, nh = int(w * target_h / h), target_h
-                            pil = pil.resize((nw, nh))
+                            if h != nh:
+                                pil_obj = pil_obj.resize((nw, nh), resample=_PIL2.LANCZOS)
                             arr = None
 
-                        if use_turbo and CV2_AVAILABLE:
-                            buf = tj.encode(arr, quality=quality, jpeg_subsample=TJSAMP_420, pixel_format=TJPF_BGR)
-                        elif pil_img_class and CV2_AVAILABLE:
-                            bio = io.BytesIO()
-                            pil_img_class.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)).save(bio, format="JPEG", quality=quality, subsampling=2)
-                            buf = bio.getvalue()
-                        elif CV2_AVAILABLE:
-                            _, enc = cv2.imencode('.jpg', arr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-                            buf = enc.tobytes()
-                        else:
-                            bio = io.BytesIO()
-                            pil.save(bio, format="JPEG", quality=quality)
-                            buf = bio.getvalue()
+                        # replace stale frame instead of dropping new one
+                        if _pipe.full():
+                            try: _pipe.get_nowait()
+                            except: pass
+                        try: _pipe.put_nowait((arr, pil_obj, cfg))
+                        except: pass
 
-                        socketio.emit('frame', {'data': base64.b64encode(buf).decode(), 'size': len(buf)})
-
-                        sleep_t = (1.0 / fps) - (time.time() - t0)
-                        if sleep_t > 0: time.sleep(sleep_t)
+                        elapsed = time.perf_counter() - t0
+                        sleep_t = frame_budget - elapsed
+                        if sleep_t > 0.001:
+                            time.sleep(sleep_t)
 
                     except Exception as e:
                         _screen_last_error = str(e)
@@ -461,6 +565,10 @@ def screen_worker():
         except Exception as e:
             _screen_last_error = str(e)
             print(f"❌ screen_worker: {e}")
+        finally:
+            try: _pipe.put_nowait(None)
+            except: pass
+            emit_thread.join(timeout=2)
 
 
 _mic_queue   = _queue.Queue(maxsize=40)
@@ -497,7 +605,7 @@ def on_screen_stop(d):
 def on_stream_config(d):
     with _stream_config_lock:
         if 'height'       in d: stream_config['height']          = int(d['height'])
-        if 'quality'      in d: stream_config['quality']         = max(10, min(95, int(d['quality'])))
+        if 'quality'      in d: stream_config['quality']         = max(10, min(100, int(d['quality'])))
         if 'fps'          in d: stream_config['fps']             = max(1, min(60, int(d['fps'])))
         if 'monitor'      in d: stream_config['monitor']         = max(1, int(d['monitor']))
         if 'cursor_color' in d:
@@ -524,36 +632,45 @@ def _log_event(event_type, detail=''):
 def index():
     path = os.path.join(BASE_DIR, 'portdesk_client.html')
     if not os.path.isfile(path):
-        return "portdesk_client.html not found — ضع الملف جنب السيرفر", 500
+        return "portdesk_client.html not found — place it next to the server", 500
     _log_event('connect')
     return send_file(path)
 
 @app.route('/security/whitelist')
 def get_whitelist():
-    return jsonify(security)
+    ip = request.remote_addr
+    wl = security.get("whitelist", [])
+    return jsonify({"approved": ip in wl, "ip": ip})
 
-@app.route('/security/whitelist/add', methods=['POST'])
-def whitelist_add():
-    ip = request.remote_addr  # بيضيف نفسه بس مش IP تاني
-    with _sec_lock:
-        if ip not in security["whitelist"]:
-            security["whitelist"].append(ip)
-            _save_security()
-    return jsonify({"ok": True, "ip": ip})
+@app.route('/security/whitelist/request', methods=['POST'])
+def whitelist_request():
+    ip = request.remote_addr
+    if ip in security.get("blacklist", []):
+        return jsonify({"error": "blacklisted"}), 403
+    if ip in security.get("whitelist", []):
+        return jsonify({"ok": True, "already": True})
+    _prompt_add_ip(ip)
+    return jsonify({"ok": True, "pending": True})
 
-@app.route('/security/whitelist/remove', methods=['POST'])
-def whitelist_remove():
-    ip = (request.get_json() or {}).get("ip", "")
+@app.route('/security/whitelist/remove_self', methods=['POST'])
+def whitelist_remove_self():
+    ip = request.remote_addr
     with _sec_lock:
-        if ip in security["whitelist"]:
+        if ip in security.get("whitelist", []):
             security["whitelist"].remove(ip)
             _save_security()
     return jsonify({"ok": True})
 
-@app.route('/security/whitelist/clear', methods=['POST'])
-def whitelist_clear():
+@app.route('/security/blacklist/remove', methods=['POST'])
+def blacklist_remove():
+    # server-only: only localhost can call this, or handle via command line
+    if request.remote_addr not in ('127.0.0.1', '::1', 'localhost'):
+        return jsonify({"error": "forbidden"}), 403
+    ip = (request.get_json() or {}).get("ip", "")
     with _sec_lock:
-        security["whitelist"] = []
+        if ip in security.get("blacklist", []):
+            security["blacklist"].remove(ip)
+        _reject_counts[ip] = 0
         _save_security()
     return jsonify({"ok": True})
 
@@ -561,6 +678,7 @@ def whitelist_clear():
 def screen_status():
     return jsonify({
         'streaming': screen_streaming,
+        'thread_alive': screen_thread is not None and screen_thread.is_alive(),
         'mss': MSS_AVAILABLE,
         'error': _screen_last_error,
     })
@@ -763,7 +881,7 @@ def _clipboard_watcher():
     try:
         import pyperclip
     except ImportError:
-        print("⚠ pyperclip غير متوفر — clipboard sync معطل"); return
+        print("⚠ pyperclip not available — clipboard sync disabled"); return
     while _clip_running:
         try:
             current = pyperclip.paste()
@@ -775,7 +893,7 @@ def _clipboard_watcher():
         time.sleep(2)
 
 # ── File Explorer ──────────────────────────────────────────────────────────────
-import zipfile, string as _string
+import zipfile
 
 def _list_drives():
     if platform.system() == 'Windows':
@@ -796,24 +914,36 @@ def explorer_list():
     if not path:
         return jsonify({'drives': _list_drives()})
     if not os.path.exists(path):
-        return jsonify({'error': 'المسار غير موجود'}), 404
+        return jsonify({'error': 'Path not found'}), 404
     try:
         entries = []
         for name in sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path,x)), x.lower())):
             full = os.path.join(path, name)
             try:
                 stat = os.stat(full)
-                entries.append({
-                    'name': name,
-                    'type': 'dir' if os.path.isdir(full) else 'file',
-                    'size': stat.st_size if os.path.isfile(full) else 0,
-                    'modified': int(stat.st_mtime)
-                })
+                if os.path.isdir(full):
+                    try:
+                        dir_size = sum(
+                            os.path.getsize(os.path.join(r, f))
+                            for r, _, files in os.walk(full)
+                            for f in files
+                        )
+                    except Exception:
+                        dir_size = 0
+                    entries.append({
+                        'name': name, 'type': 'dir',
+                        'size': dir_size, 'modified': int(stat.st_mtime)
+                    })
+                else:
+                    entries.append({
+                        'name': name, 'type': 'file',
+                        'size': stat.st_size, 'modified': int(stat.st_mtime)
+                    })
             except PermissionError:
                 entries.append({'name': name, 'type': 'dir' if os.path.isdir(full) else 'file', 'size': 0, 'modified': 0, 'denied': True})
         return jsonify({'path': path, 'entries': entries})
     except PermissionError:
-        return jsonify({'error': 'لا يوجد صلاحية'}), 403
+        return jsonify({'error': 'Permission denied'}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -852,9 +982,7 @@ def explorer_download_multi():
                 for root, _, files in os.walk(p):
                     for fname in files:
                         full = os.path.join(root, fname)
-                        try:
-                            # التعديل هنا: استخدم p مباشرة بدلاً من os.path.dirname(p)
-                            zf.write(full, os.path.relpath(full, os.path.dirname(p) if os.path.dirname(p) else p))
+                        try: zf.write(full, os.path.relpath(full, p))
                         except: pass
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name='pcc_files.zip', mimetype='application/zip')
@@ -863,7 +991,7 @@ def explorer_download_multi():
 def explorer_upload():
     dest_dir = request.form.get('path', os.path.join(os.path.expanduser('~'), 'Downloads'))
     if not os.path.isdir(dest_dir):
-        return jsonify({'error': 'المجلد غير موجود'}), 400
+        return jsonify({'error': 'Folder not found'}), 400
     saved = []
     for f in request.files.getlist('files'):
         safe = os.path.basename(f.filename)
@@ -886,7 +1014,7 @@ def explorer_mkdir():
     try:
         os.makedirs(target, exist_ok=False)
         return jsonify({'ok': True})
-    except FileExistsError: return jsonify({'error': 'الاسم موجود'}), 409
+    except FileExistsError: return jsonify({'error': 'Name already exists'}), 409
     except Exception as e:  return jsonify({'error': str(e)}), 500
 
 @app.route('/explorer/mkfile', methods=['POST'])
@@ -896,7 +1024,7 @@ def explorer_mkfile():
     name = d.get('name','').strip()
     if not path or not name: return jsonify({'error': 'missing params'}), 400
     target = os.path.join(path, name)
-    if os.path.exists(target): return jsonify({'error': 'الاسم موجود'}), 409
+    if os.path.exists(target): return jsonify({'error': 'Name already exists'}), 409
     try:
         open(target, 'w').close()
         return jsonify({'ok': True})
@@ -909,7 +1037,7 @@ def explorer_rename():
     new_name = d.get('name','').strip()
     if not src or not new_name: return jsonify({'error': 'missing params'}), 400
     dst = os.path.join(os.path.dirname(src), new_name)
-    if os.path.exists(dst): return jsonify({'error': 'الاسم موجود'}), 409
+    if os.path.exists(dst): return jsonify({'error': 'Name already exists'}), 409
     try:
         os.rename(src, dst)
         return jsonify({'ok': True})
@@ -935,7 +1063,7 @@ def explorer_copy():
     srcs = d.get('paths', [])
     dst  = d.get('dest', '').strip()
     if not srcs or not dst: return jsonify({'error': 'missing params'}), 400
-    if not os.path.isdir(dst): return jsonify({'error': 'المقصد غير موجود'}), 400
+    if not os.path.isdir(dst): return jsonify({'error': 'Destination not found'}), 400
     errors = []
     for s in srcs:
         try:
@@ -953,7 +1081,7 @@ def explorer_move():
     srcs = d.get('paths', [])
     dst  = d.get('dest', '').strip()
     if not srcs or not dst: return jsonify({'error': 'missing params'}), 400
-    if not os.path.isdir(dst): return jsonify({'error': 'المقصد غير موجود'}), 400
+    if not os.path.isdir(dst): return jsonify({'error': 'Destination not found'}), 400
     errors = []
     for s in srcs:
         try: _shutil.move(s, os.path.join(dst, os.path.basename(s.rstrip('/\\'))))
@@ -1152,7 +1280,7 @@ def tasks_list():
         procs.sort(key=lambda x: x['cpu'], reverse=True)
         return jsonify(procs[:80])
     except ImportError:
-        return jsonify({'error': 'psutil غير مثبت'}), 500
+        return jsonify({'error': 'psutil not installed'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1205,7 +1333,7 @@ def _audio_worker():
                 device_idx = i
                 break
         if device_idx is None:
-            print("❌ audio: CABLE Output مش موجود — شغّل VB-Audio")
+            print("❌ audio: CABLE Output not found — start VB-Audio")
             audio_streaming = False
             return
         with sd.InputStream(samplerate=_AUDIO_RATE, channels=1, dtype='int16',
@@ -1256,8 +1384,9 @@ def on_audio_stop(d):
 # ── Brute Force Protection ─────────────────────────────────────────────────────
 _pin_fails      = defaultdict(int)
 _pin_lockout    = {}
+_pin_lockout_count = defaultdict(int)
 PIN_MAX_TRIES   = 5
-PIN_LOCKOUT_SEC = 60
+PIN_LOCKOUT_STEPS = [60, 180, 300]
 
 @app.route('/auth/pin_check', methods=['POST'])
 def auth_pin_check():
@@ -1265,7 +1394,7 @@ def auth_pin_check():
     now = time.time()
     if ip in _pin_lockout and now < _pin_lockout[ip]:
         rem = int(_pin_lockout[ip] - now)
-        return jsonify({'error': f'محظور. انتظر {rem} ثانية'}), 429
+        return jsonify({'error': f'Blocked. Wait {rem} seconds'}), 429
     d    = request.get_json() or {}
     ok   = d.get('ok', False)
     if ok:
@@ -1276,9 +1405,12 @@ def auth_pin_check():
     _pin_fails[ip] += 1
     _log_event('pin_fail', f'attempt={_pin_fails[ip]}')
     if _pin_fails[ip] >= PIN_MAX_TRIES:
-        _pin_lockout[ip] = now + PIN_LOCKOUT_SEC
+        step     = _pin_lockout_count[ip]
+        duration = PIN_LOCKOUT_STEPS[min(step, len(PIN_LOCKOUT_STEPS) - 1)]
+        _pin_lockout_count[ip] += 1
+        _pin_lockout[ip] = now + duration
         _pin_fails[ip]   = 0
-        return jsonify({'error': f'تم القفل {PIN_LOCKOUT_SEC} ثانية بسبب محاولات خاطئة متعددة'}), 429
+        return jsonify({'error': f'Locked for {duration} seconds due to multiple failed attempts'}), 429
     return jsonify({'ok': False, 'remaining': PIN_MAX_TRIES - _pin_fails[ip]})
 
 # ── Scheduled Tasks ────────────────────────────────────────────────────────────
@@ -1379,7 +1511,7 @@ def _mic_worker():
                 device_idx = i
                 break
         if device_idx is None:
-            print("❌ mic: CABLE Input مش موجود — شغّل VB-Audio")
+            print("❌ mic: CABLE Input not found — start VB-Audio")
             _mic_active = False
             return
         stream = sd.RawOutputStream(samplerate=44100, channels=1, dtype='int16',
@@ -1402,7 +1534,6 @@ def _mic_worker():
 @socketio.on('mic_start')
 @ws_required
 def on_mic_start(d):
-    global _mic_worker_thread
     global _mic_active, _mic_worker_thread
     if _mic_worker_thread and _mic_worker_thread.is_alive():
         _mic_active = False
@@ -1465,24 +1596,29 @@ if __name__ == '__main__':
     key_file  = os.path.join(BASE_DIR, 'key.pem')
     use_https = os.path.isfile(cert_file) and os.path.isfile(key_file)
 
-    print(f"\n{'═'*50}\n  🎮 PortDesk v1.0\n{'═'*50}")
-    print(f"  Official release: https://github.com/Lucky_abdo/PortDesk")
-    print(f"  Modified or redistributed versions may not provide")
-    print(f"  the same privacy and security guarantees. Use with caution.")
-    print(f"{'═'*50}")
+    print(f"\n{'═'*52}")
+    print(f"  \U0001f3ae  PortDesk v1.0  \u2014  Official Release")
+    print(f"{'─'*52}")
+    print(f"  \u270d  Developed by  :  Lucky_abdo")
+    print(f"  \U0001f517  GitHub        :  github.com/Lucky-abdo/PortDesk")
+    print(f"{'─'*52}")
+    print(f"  \u2139  This is the original, unmodified official build.")
+    print(f"     Forks or modified copies are NOT endorsed and may")
+    print(f"     lack the security and privacy guarantees of this release.")
+    print(f"{'═'*52}")
     if use_https:
         print(f"  [USB]  adb reverse tcp:5000 tcp:5000 → https://localhost:5000")
         print(f"  [WiFi] https://{local_ip}:5000")
-        print(f"  🔒 HTTPS مفعّل — الميكروفون شغال على WiFi")
+        print(f"  🔒 HTTPS enabled — microphone works over WiFi")
     else:
         print(f"  [USB]  adb reverse tcp:5000 tcp:5000 → http://localhost:5000")
         print(f"  [WiFi] http://{local_ip}:5000")
-        print(f"  ⚠ HTTP فقط — شغّل gen_cert.py لتفعيل HTTPS")
+        print(f"  ⚠ HTTP only — run gen_cert.py to enable HTTPS")
     print(f"{'═'*50}\n")
 
     if use_https:
         ssl_ctx = __import__('ssl').SSLContext(__import__('ssl').PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(cert_file, key_file)
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False, ssl_context=ssl_ctx)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, ssl_context=ssl_ctx, allow_unsafe_werkzeug=True)
     else:
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
