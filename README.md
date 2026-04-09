@@ -77,6 +77,27 @@ You'll see something like:
 
 ---
 
+## 🐳 Docker (Linux Only)
+
+> Docker is recommended for Linux users who want to run PortDesk without installing Python or any dependencies manually.
+> 
+> **Not suitable for Windows or macOS** — PortDesk needs direct access to your screen, keyboard, and mouse, which Docker can only provide properly on Linux.
+
+### Pull and run
+
+```bash
+docker run -d \
+  --network=host \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  --device /dev/snd \
+  luckyabdo/portdesk:latest
+```
+
+Then open `http://localhost:5000` in your browser or on any device on the same network.
+
+---
+
 ## Connection Modes
 
 ### WiFi Mode
@@ -314,4 +335,4 @@ MIT License — see [LICENSE](LICENSE)
 
 ## A note on development
 
-PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were human-driven, but AI was used throughout the development process for code generation, debugging, and documentation. We believe honesty about how software is built matters.
+PortDesk was built with the assistance of AI tools. This is mentioned in the spirit of transparency — the architecture, decisions, and direction were by me, but AI was used throughout the development process for code generation, debugging, and documentation.
