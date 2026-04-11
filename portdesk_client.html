@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>PC Controller</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Tajawal:wght@400;700;900&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+
 <style>
 :root{--bg:#0b0c0f;--surface:#13151a;--border:#1e2028;--accent:#00d4ff;--accent2:#ff3d6b;--text:#e8eaf0;--muted:#4a4f5e;--green:#00ff88;--r:12px;}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;touch-action:manipulation;}
@@ -601,6 +601,7 @@ body.gaming-mode .gc-main-grid{overflow:visible;}
   <div class="screen-wrap">
     <div class="screen-hint" id="screen-hint" data-i18n="scr_hint">اضغط تشغيل لعرض شاشة الكمبيوتر</div>
     <canvas id="screen-canvas" class="screen-img" style="display:none"></canvas>
+    <video id="screen-video" class="screen-img" autoplay playsinline muted style="display:none;width:100%;height:auto;object-fit:contain;"></video>
 
     <!-- Controls row -->
     <div class="screen-controls">
@@ -608,7 +609,7 @@ body.gaming-mode .gc-main-grid{overflow:visible;}
       <button class="screen-btn stop" id="screen-stop-btn" onclick="stopScreen()" style="display:none" data-i18n="scr_stop">⏹ إيقاف</button>
       <button class="screen-btn" onclick="toggleFullscreen()" style="background:var(--surface);border-color:var(--border);color:var(--text)">⛶</button>
       <button class="screen-btn" onclick="toggleScreenSettings()" style="background:var(--surface);border-color:var(--border);color:var(--muted)">⚙️</button>
-      <button class="screen-btn" onclick="checkScreenStatus()" style="background:var(--surface);border-color:var(--border);color:var(--muted);font-size:10px">🔍</button>
+
       <div class="scr-stat" id="scr-stat">-- KB/s</div>
       <div class="scr-stat" id="scr-fps-real" style="color:var(--accent);border-color:var(--accent)33">-- fps</div>
     </div>
@@ -626,7 +627,7 @@ body.gaming-mode .gc-main-grid{overflow:visible;}
         </select>
       </div>
       <div class="scr-set-row">
-        <label data-i18n="scr_quality">🎨 جودة</label>
+        <label data-i18n="scr_quality">🎨 جودة</label><span id="scr-quality-note" style="font-size:9px;color:var(--muted);margin-right:4px">(WebSocket فقط)</span>
         <input type="range" id="scr-quality" min="10" max="100" value="65" oninput="document.getElementById('scr-q-val').textContent=this.value;applyStreamConfig()">
         <span class="sv" id="scr-q-val">65</span>
       </div>
@@ -1064,8 +1065,310 @@ function loadAllSettings() {
 }
 
 
+// ── WebSocket Shim (drop-in replacement for socket.io) ──────────────────────
+var _ws = null;
+var _wsHandlers  = {};
+var _wsQueue     = [];
+var _wsConnected = false;
+var _wsReconnectTimer = null;
+
+// ── Binary frame rendering ───────────────────────────────────────────────────
+// Protocol:
+//   Full  [0x01][fw:u16be][fh:u16be][jpeg...]            (5B header)
+//   Patch [0x02][fw:u16be][fh:u16be][px][py][pw][ph][len:u32be][jpeg...]  (13B header + 4B len = 17B)
+
+function _handleBinaryFrame(buf) {
+    if (!screenActive || _webrtcMode) return;
+    var vid = document.getElementById('screen-video');
+    if (vid.style.display !== 'none') vid.style.display = 'none';
+    if (screenCanvas.style.display === 'none') {
+        screenCanvas.style.display = 'block';
+        document.getElementById('screen-hint').style.display = 'none';
+    }
+
+    var view = new DataView(buf);
+    var type = view.getUint8(0);
+    var fw   = view.getUint16(1, false);
+    var fh   = view.getUint16(3, false);
+
+    scrBytesAccum += buf.byteLength;
+
+    if (type === 0x01) {
+        var jpeg = new Uint8Array(buf, 5);
+        var blob = new Blob([jpeg], {type: 'image/jpeg'});
+        _drawFullBlob(blob, fw, fh);
+    } else if (type === 0x02) {
+        var px   = view.getUint16(5,  false);
+        var py   = view.getUint16(7,  false);
+        var pw   = view.getUint16(9,  false);
+        var ph   = view.getUint16(11, false);
+        var jpeg = new Uint8Array(buf, 17);
+        var blob = new Blob([jpeg], {type: 'image/jpeg'});
+        _drawPatchBlob(blob, fw, fh, px, py, pw, ph);
+    }
+}
+
+function _getCtx() {
+    if (!screenCtx) screenCtx = screenCanvas.getContext('2d', {alpha: false, desynchronized: true});
+    return screenCtx;
+}
+
+function _createBitmap(blob) {
+    return createImageBitmap(blob, {premultiplyAlpha:'none', colorSpaceConversion:'none'})
+        .catch(function() { return createImageBitmap(blob); });
+}
+
+function _drawFullBlob(blob, fw, fh) {
+    if (_useImageBitmap) {
+        _createBitmap(blob).then(function(bmp) {
+            if (!screenActive) { bmp.close(); return; }
+            if (_pendingBitmap) _pendingBitmap.close();
+            _pendingBitmap = bmp;
+            if (!_rafScheduled) { _rafScheduled = true; requestAnimationFrame(_renderPendingBitmap); }
+        }).catch(function(){});
+    } else {
+        var url = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function() {
+            URL.revokeObjectURL(url);
+            if (!screenActive) return;
+            _applyDPRCanvas(fw, fh);
+            var dpr = window.devicePixelRatio || 1;
+            var cssW = screenCanvas.width / dpr, cssH = screenCanvas.height / dpr;
+            _getCtx().drawImage(img, 0, 0, fw, fh, 0, 0, cssW, cssH);
+        };
+        img.src = url;
+    }
+}
+
+function _drawPatchBlob(blob, fw, fh, px, py, pw, ph) {
+    _applyDPRCanvas(fw, fh);
+    var dpr    = window.devicePixelRatio || 1;
+    var cssW   = screenCanvas.width  / dpr;
+    var cssH   = screenCanvas.height / dpr;
+    var scaleX = cssW / fw;
+    var scaleY = cssH / fh;
+    var ctx    = _getCtx();
+    if (_useImageBitmap) {
+        _createBitmap(blob).then(function(bmp) {
+            if (!screenActive) { bmp.close(); return; }
+            ctx.drawImage(bmp, 0, 0, pw, ph, px*scaleX, py*scaleY, pw*scaleX, ph*scaleY);
+            bmp.close();
+        }).catch(function(){});
+    } else {
+        var url = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function() {
+            URL.revokeObjectURL(url);
+            if (!screenActive) return;
+            ctx.drawImage(img, 0, 0, pw, ph, px*scaleX, py*scaleY, pw*scaleX, ph*scaleY);
+        };
+        img.src = url;
+    }
+}
+
+function _initWS() {
+    clearTimeout(_wsReconnectTimer);
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    try {
+        _ws = new WebSocket(proto + '//' + location.host + '/ws');
+        _ws.binaryType = 'arraybuffer';
+    } catch(e) { _wsReconnectTimer = setTimeout(_initWS, 3000); return; }
+
+    _ws.onopen = function() {
+        _wsConnected = true;
+        _wsQueue.forEach(function(m){ _ws.send(m); });
+        _wsQueue = [];
+        (_wsHandlers['connect'] || []).forEach(function(h){ h(); });
+    };
+    _ws.onclose = function() {
+        _wsConnected = false;
+        (_wsHandlers['disconnect'] || []).forEach(function(h){ h(); });
+        _wsReconnectTimer = setTimeout(_initWS, 2000);
+    };
+    _ws.onerror = function() { _ws.close(); };
+    _ws.onmessage = function(e) {
+        if (e.data instanceof ArrayBuffer) {
+            _handleBinaryFrame(e.data);
+            return;
+        }
+        var d;
+        try { d = JSON.parse(e.data); } catch(ex) { return; }
+        var evName = d.type;
+        if (!evName) return;
+        var payload = Object.assign({}, d);
+        delete payload.type;
+        (_wsHandlers[evName] || []).forEach(function(h){ h(payload); });
+    };
+}
+
+var socket = {
+    emit: function(event, data) {
+        var msg = JSON.stringify(Object.assign({ _ev: event }, data || {}));
+        if (_wsConnected) _ws.send(msg);
+        else _wsQueue.push(msg);
+    },
+    on: function(event, handler) {
+        if (!_wsHandlers[event]) _wsHandlers[event] = [];
+        _wsHandlers[event].push(handler);
+    },
+    off: function(event, handler) {
+        if (!_wsHandlers[event]) return;
+        if (handler) _wsHandlers[event] = _wsHandlers[event].filter(function(h){ return h !== handler; });
+        else _wsHandlers[event] = [];
+    }
+};
+
+_initWS();
+
+// ── WebRTC Screen Streaming ──────────────────────────────────────────────────
+var _pc            = null;
+var _webrtcMode    = false;
+var _webrtcTimeout = null;
+
+function _preferCodec(sdp, codec) {
+    var lines = sdp.split('\n');
+    var mIdx  = -1;
+    for (var i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith('m=video')) { mIdx = i; break; }
+    }
+    if (mIdx < 0) return sdp;
+    var pt = null;
+    for (var i = 0; i < lines.length; i++) {
+        var m = lines[i].match(/a=rtpmap:(\d+) VP9/i);
+        if (m) { pt = m[1]; break; }
+    }
+    if (!pt) return sdp;
+    var mParts = lines[mIdx].split(' ');
+    var pts    = mParts.slice(3);
+    var idx    = pts.indexOf(pt);
+    if (idx > 0) { pts.splice(idx, 1); pts.unshift(pt); }
+    lines[mIdx] = mParts.slice(0, 3).concat(pts).join(' ');
+    return lines.join('\n');
+}
+
+function _waitIceGathering(pc) {
+    return new Promise(function(resolve) {
+        if (pc.iceGatheringState === 'complete') { resolve(); return; }
+        var done = false;
+        function finish() { if (!done) { done = true; resolve(); } }
+        pc.onicegatheringstatechange = function() {
+            if (pc.iceGatheringState === 'complete') finish();
+        };
+        setTimeout(finish, 2500);
+    });
+}
+
+function _startWebRTC() {
+    if (!window.RTCPeerConnection) { _startScreenWS(); return; }
+    _pc = new RTCPeerConnection({ iceServers: [] });
+
+    _pc.ontrack = function(e) {
+        if (!screenActive) return;
+        clearTimeout(_webrtcTimeout);
+        var vid = document.getElementById('screen-video');
+        vid.srcObject = e.streams[0];
+        vid.style.display = 'block';
+        document.getElementById('screen-canvas').style.display = 'none';
+        document.getElementById('screen-hint').style.display  = 'none';
+        _webrtcMode = true;
+        _startWebRTCStats();
+    };
+
+    _pc.onconnectionstatechange = function() {
+        if (_pc && (_pc.connectionState === 'failed' || _pc.connectionState === 'disconnected')) {
+            _pc.close(); _pc = null; _webrtcMode = false;
+            _startScreenWS();
+        }
+    };
+
+    _pc.addTransceiver('video', { direction: 'recvonly' });
+
+    _pc.createOffer()
+        .then(function(offer) {
+            offer = new RTCSessionDescription({ type: offer.type, sdp: _preferCodec(offer.sdp, 'VP9') });
+            return _pc.setLocalDescription(offer);
+        })
+        .then(function() { return _waitIceGathering(_pc); })
+        .then(function() {
+            return fetch('/webrtc/offer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sdp: _pc.localDescription.sdp, type: _pc.localDescription.type })
+            });
+        })
+        .then(function(r) { return r.json(); })
+        .then(function(answer) {
+            if (answer.error) throw new Error(answer.error);
+            return _pc.setRemoteDescription(new RTCSessionDescription(answer));
+        })
+        .catch(function(err) {
+            console.warn('WebRTC failed:', err);
+            clearTimeout(_webrtcTimeout);
+            if (_pc) { _pc.close(); _pc = null; }
+            _webrtcMode = false;
+            if (screenActive) _startScreenWS();
+        });
+
+    _webrtcTimeout = setTimeout(function() {
+        if (!_webrtcMode && screenActive) {
+            if (_pc) { _pc.close(); _pc = null; }
+            _startScreenWS();
+        }
+    }, 6000);
+}
+
+function _startScreenWS() {
+    fetch('/screen/start', { method: 'POST' }).then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) toast(currentLang==='en'?'📡 Starting screen (WS)...':'📡 تشغيل الشاشة (WS)...');
+        else { toast(currentLang==='en'?'❌ Failed':'❌ فشل'); stopScreen(); }
+    }).catch(function(e){ toast('❌ ' + e); stopScreen(); });
+}
+
+var _webrtcStatsTimer = null;
+var _webrtcLastBytes  = 0;
+var _webrtcLastFrames = 0;
+var _webrtcLastTs     = 0;
+var _webrtcBwEma      = 0;
+var _webrtcFpsEma     = 0;
+
+function _startWebRTCStats() {
+    _webrtcLastBytes = 0; _webrtcLastFrames = 0; _webrtcLastTs = 0;
+    _webrtcBwEma = 0; _webrtcFpsEma = 0;
+    clearInterval(_webrtcStatsTimer);
+    _webrtcStatsTimer = setInterval(function() {
+        if (!_webrtcMode || !_pc) { clearInterval(_webrtcStatsTimer); return; }
+        _pc.getStats(null).then(function(stats) {
+            stats.forEach(function(report) {
+                if (report.type !== 'inbound-rtp' || report.kind !== 'video') return;
+                var now    = report.timestamp;
+                var bytes  = report.bytesReceived || 0;
+                var frames = report.framesDecoded  || 0;
+                if (_webrtcLastTs > 0) {
+                    var dt  = (now - _webrtcLastTs) / 1000;
+                    var bps = (bytes  - _webrtcLastBytes)  / dt;
+                    var fps = (frames - _webrtcLastFrames) / dt;
+                    _webrtcBwEma  = _webrtcBwEma  === 0 ? bps : _webrtcBwEma  * 0.6 + bps * 0.4;
+                    _webrtcFpsEma = _webrtcFpsEma === 0 ? fps : _webrtcFpsEma * 0.6 + fps * 0.4;
+                    var label = _webrtcBwEma >= 1024*100
+                        ? (_webrtcBwEma/1048576).toFixed(2)+' MB/s'
+                        : (_webrtcBwEma/1024).toFixed(1)+' KB/s';
+                    var fpsInt = Math.round(_webrtcFpsEma);
+                    document.getElementById('scr-stat').textContent = label;
+                    var el = document.getElementById('scr-fps-real');
+                    if (el) {
+                        el.textContent = fpsInt + ' fps';
+                        el.style.color = fpsInt >= 50 ? 'var(--green)' : fpsInt >= 25 ? 'var(--accent)' : 'var(--accent2)';
+                    }
+                }
+                _webrtcLastBytes = bytes; _webrtcLastFrames = frames; _webrtcLastTs = now;
+            });
+        }).catch(function(){});
+    }, 1000);
+}
+
 // ── Socket (deferred) ──────────────────────────────────────────────────────────
-var socket = io({ transports: ['websocket', 'polling'] });
+var _wsAlreadyInit = true; // WebSocket shim initialized above
 socket.on('connect', function() {
     document.getElementById('status-pill').className = 'status-pill on';
     document.getElementById('status-text').textContent = '✓';
@@ -1098,6 +1401,7 @@ function switchTab(id) {
     if (id !== 'screen') stopScreen();
     if (id === 'screen') setTimeout(function() { _lastFrameW = 0; }, 50);
     if (id === 'sched') loadScheduled();
+    if (selectMode) { selectMode = false; socket.emit('key_up', { key: 'shift' }); }
     var fst = document.getElementById('fs-toggle');
     if (fst) fst.style.display = id === 'gaming' ? 'block' : 'none';
 }
@@ -1294,6 +1598,7 @@ tp.addEventListener('touchstart', function(e) {
 
 tp.addEventListener('touchmove', function(e) {
     e.preventDefault();
+    if (!lastPos) return;
     if (e.touches.length === 1) {
         var t = e.touches[0], dx = t.clientX - lastPos.x, dy = t.clientY - lastPos.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) { moved = true; clearTimeout(lpTimer); }
@@ -1655,8 +1960,10 @@ function renderFromLayout() {
         el.style.width    = item.w + 'px';
         el.style.height   = item.h + 'px';
         var fs = _calcFontSize(Math.min(item.w, item.h));
-        el.innerHTML = '<div class="gc-placed-icon" style="font-size:' + fs + 'px">' + item.icon + '</div>' +
-                       '<div class="gc-placed-key">' + (item.key || '—') + '</div>';
+        el.innerHTML = '<div class="gc-placed-icon" style="font-size:' + fs + 'px"></div>' +
+                       '<div class="gc-placed-key"></div>';
+        el.querySelector('.gc-placed-icon').textContent = item.icon || '';
+        el.querySelector('.gc-placed-key').textContent  = item.key  || '—';
         var k = item.key || '';
         el.addEventListener('pointerdown', function(ev) {
             ev.preventDefault();
@@ -2040,22 +2347,33 @@ var scrBytesAccum = 0, scrLastTime = Date.now();
 var screenActive = false;
 var _frameImg = new Image();
 var screenCanvas = document.getElementById('screen-canvas');
-var screenCtx = null;
 
 function startScreen() {
     screenActive = true;
-    screenCanvas.style.display = 'block';
+    document.getElementById('screen-canvas').style.display = 'none';
+    document.getElementById('screen-video').style.display  = 'none';
     document.getElementById('screen-hint').style.display = 'none';
     document.getElementById('screen-start-btn').style.display = 'none';
     document.getElementById('screen-stop-btn').style.display = 'block';
-    fetch('/screen/start', {method:'POST'}).then(function(r){ return r.json(); }).then(function(d){
-        if (d.ok) toast(currentLang==='en'?'📡 Starting screen...':'📡 تشغيل الشاشة...');
-        else { toast(currentLang==='en'?'❌ Failed':'❌ فشل'); stopScreen(); }
-    }).catch(function(e){ toast('❌ ' + e); stopScreen(); });
+    _webrtcMode = false;
+    _startWebRTC();
 }
 function stopScreen() {
     if (!screenActive) return;
     screenActive = false;
+    clearTimeout(_webrtcTimeout);
+    document.getElementById('scr-settings').style.display = 'none';
+
+    if (_pc) {
+        try { _pc.close(); } catch(e) {}
+        _pc = null;
+    }
+    _webrtcMode = false;
+    clearInterval(_webrtcStatsTimer);
+    var vid = document.getElementById('screen-video');
+    if (vid.srcObject) { vid.srcObject.getTracks().forEach(function(t){ t.stop(); }); vid.srcObject = null; }
+    vid.style.display = 'none';
+
     if (_pendingBitmap) { try { _pendingBitmap.close(); } catch(e){} _pendingBitmap = null; }
     _rafScheduled = false;
     fetch('/screen/stop', {method:'POST'}).catch(function(){});
@@ -2064,13 +2382,14 @@ function stopScreen() {
     document.getElementById('screen-hint').style.display = 'block';
     document.getElementById('screen-start-btn').style.display = 'block';
     document.getElementById('screen-stop-btn').style.display = 'none';
-    scrBytesAccum = 0; scrLastTime = Date.now();
+    scrBytesAccum = 0; scrLastTime = Date.now(); _bwEma = 0;
     document.getElementById('scr-stat').textContent = '-- KB/s';
     document.getElementById('scr-fps-real').textContent = '-- fps';
 }
 function checkScreenStatus() {
     fetch('/screen/status').then(function(r){ return r.json(); }).then(function(d) {
-        var msg = 'stream:' + d.streaming + ' thread:' + d.thread_alive + ' mss:' + d.mss;
+        var backend = d.dxcam ? 'dxcam' : (d.mss ? 'mss' : '❌');
+        var msg = 'stream:' + d.streaming + ' thread:' + d.thread_alive + ' backend:' + backend;
         if (d.error) msg += ' ERR:' + d.error;
         toast(msg);
         if (d.error) alert('Screen Error:\n' + d.error);
@@ -2085,13 +2404,29 @@ function toggleFullscreen() {
 (function() {
     var stp = document.getElementById('screen-tp');
     var slast = null, smoved = false, slp = null;
+    var s2last = null;
     stp.addEventListener('touchstart', function(e) {
-        e.preventDefault(); slast = { x:e.touches[0].clientX, y:e.touches[0].clientY }; smoved = false;
+        e.preventDefault();
+        smoved = false;
+        if (e.touches.length === 2) {
+            s2last = { y: (e.touches[0].clientY + e.touches[1].clientY) / 2 };
+            clearTimeout(slp); slast = null; return;
+        }
+        s2last = null;
+        slast = { x:e.touches[0].clientX, y:e.touches[0].clientY };
         if (selectMode) { socket.emit('selector_start', {}); return; }
         slp = setTimeout(function() { if (!smoved) { socket.emit('click', { type:'right' }); vibrateAction('right_click'); } }, 600);
     }, { passive:false });
     stp.addEventListener('touchmove', function(e) {
         e.preventDefault();
+        if (e.touches.length === 2 && s2last) {
+            var cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            var dy = cy - s2last.y;
+            if (Math.abs(dy) > 2) socket.emit('scroll', { dy: Math.round(dy * scrollSpeed * 0.3) });
+            s2last = { y: cy };
+            return;
+        }
+        if (!slast) return;
         var dx = e.touches[0].clientX-slast.x, dy = e.touches[0].clientY-slast.y;
         if (Math.abs(dx)+Math.abs(dy) > 3) { smoved=true; clearTimeout(slp); }
         var rdx = Math.round(dx*touchSens*.07), rdy = Math.round(dy*touchSens*.07);
@@ -2101,6 +2436,8 @@ function toggleFullscreen() {
     }, { passive:false });
     stp.addEventListener('touchend', function(e) {
         clearTimeout(slp);
+        s2last = null;
+        if (e.touches.length > 0) { slast = { x:e.touches[0].clientX, y:e.touches[0].clientY }; return; }
         if (selectMode) { socket.emit('selector_end', {}); return; }
         if (!smoved) socket.emit('click', { type:'left' });
     }, { passive:false });
@@ -2496,13 +2833,6 @@ socket.on('disconnect', function() {
     el.textContent = currentLang==='en'?'🔴 Connection lost...':'🔴 انقطع الاتصال بالسيرفر...';
     el.className = 'lost';
 });
-socket.on('reconnect', function() {
-    var el = document.getElementById('conn-alert');
-    el.textContent = currentLang==='en'?'🟢 Connection restored':'🟢 تم استعادة الاتصال';
-    el.className = 'back';
-    clearTimeout(_connAlertTimer);
-    _connAlertTimer = setTimeout(function() { el.className = ''; el.style.display = 'none'; }, 3000);
-});
 socket.on('connect', function() {
     var el = document.getElementById('conn-alert');
     if (el.className === 'lost') {
@@ -2510,6 +2840,10 @@ socket.on('connect', function() {
         el.className = 'back';
         clearTimeout(_connAlertTimer);
         _connAlertTimer = setTimeout(function() { el.className = ''; }, 3000);
+        if (screenActive) {
+            screenActive = false;
+            setTimeout(startScreen, 500);
+        }
     }
 });
 
@@ -2737,11 +3071,12 @@ function loadTasks() {
         el.innerHTML = procs.map(function(p) {
             var mem = p.mem > 1048576 ? (p.mem/1048576).toFixed(0)+' MB' : (p.mem/1024).toFixed(0)+' KB';
             var cpuClass = p.cpu > 50 ? ' hot' : '';
+            var safeName = p.name.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
             return '<div class="task-item">' +
-                '<div class="task-name" title="' + p.name + '">' + p.name + '</div>' +
+                '<div class="task-name" title="' + safeName + '">' + safeName + '</div>' +
                 '<div class="task-cpu' + cpuClass + '">' + p.cpu + '%</div>' +
                 '<div class="task-mem">' + mem + '</div>' +
-                '<button class="task-kill" onclick="killTask(' + p.pid + ',\'' + p.name.replace(/'/g,"\\'") + '\')">⛔</button>' +
+                '<button class="task-kill" onclick="killTask(' + p.pid + ',\'' + safeName.replace(/'/g,"\\'") + '\')">⛔</button>' +
                 '</div>';
         }).join('');
     }).catch(function(){ document.getElementById('task-list').innerHTML = '<div class="exp-loading" style="color:var(--accent2)">' + (currentLang==='en'?'Load error':'خطأ في التحميل') + '</div>'; });
@@ -2832,7 +3167,6 @@ socket.on('stats_push', function(d) {
         _cpuHigh = false;
     }
 });
-var _frameSkipCounter = 0;
 var _pendingBitmap    = null;
 var _rafScheduled     = false;
 var _useImageBitmap   = (typeof createImageBitmap === 'function');
@@ -2882,52 +3216,19 @@ function _renderObjectURL(url, w, h) {
     _frameImg.src = url;
 }
 
-socket.on('frame', function(d) {
-    if (!screenActive) return;
-    if (_cpuHigh && _frameSkipCounter++ % 3 !== 0) return;
-    if (!_cpuHigh) _frameSkipCounter = 0;
-
-    scrBytesAccum += d.size || 0;
+// ── Bandwidth counter (updated from binary frame handler) ──────────────────
+var _bwEma = 0;
+setInterval(function() {
+    if (!screenActive || _webrtcMode) return;
     var now = Date.now();
     if (now - scrLastTime >= 1000) {
-        var acc = scrBytesAccum;
-        var label = acc >= 1024*100 ? (acc/1048576).toFixed(2)+' MB/s' : (acc/1024).toFixed(1)+' KB/s';
+        var raw = scrBytesAccum;
+        _bwEma = _bwEma === 0 ? raw : _bwEma * 0.6 + raw * 0.4;
+        var label = _bwEma >= 1024*100 ? (_bwEma/1048576).toFixed(2)+' MB/s' : (_bwEma/1024).toFixed(1)+' KB/s';
         document.getElementById('scr-stat').textContent = label;
         scrBytesAccum = 0; scrLastTime = now;
     }
-
-    var raw = d.data;
-    var blob;
-    if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
-        blob = new Blob([raw], {type: 'image/jpeg'});
-    } else {
-        var bStr = atob(raw);
-        var u8 = new Uint8Array(bStr.length);
-        for (var i = 0; i < bStr.length; i++) u8[i] = bStr.charCodeAt(i);
-        blob = new Blob([u8], {type: 'image/jpeg'});
-    }
-
-    if (_useImageBitmap) {
-        createImageBitmap(blob, {premultiplyAlpha:'none', colorSpaceConversion:'none'}).then(function(bmp) {
-            if (!screenActive) { bmp.close(); return; }
-            if (_pendingBitmap) _pendingBitmap.close();
-            _pendingBitmap = bmp;
-            if (!_rafScheduled) {
-                _rafScheduled = true;
-                requestAnimationFrame(_renderPendingBitmap);
-            }
-        }).catch(function(){});
-    } else {
-        var url = URL.createObjectURL(blob);
-        var img = new Image();
-        img.onload = function() {
-            URL.revokeObjectURL(url);
-            if (!screenActive) return;
-            _renderObjectURL(url, img.naturalWidth, img.naturalHeight);
-        };
-        img.src = url;
-    }
-});
+}, 1000);
 
 socket.on('fps_update', function(d) {
     if (!screenActive) return;
@@ -2936,6 +3237,19 @@ socket.on('fps_update', function(d) {
     var fps = d.fps;
     el.textContent = fps + ' fps';
     el.style.color = fps >= 50 ? 'var(--green)' : fps >= 25 ? 'var(--accent)' : 'var(--accent2)';
+});
+
+socket.on('screen_error', function(d) {
+    if (!screenActive) return;
+    stopScreen();
+    toast('❌ ' + (d.msg || (currentLang === 'en' ? 'Screen error' : 'خطأ في الشاشة')));
+});
+
+socket.on('ip_request', function(d) {
+    toast('🔔 ' + (currentLang === 'en' ? 'New device requesting access: ' : 'طلب دخول من: ') + d.ip);
+});
+socket.on('ip_approved', function(d) {
+    toast('✅ ' + (currentLang === 'en' ? 'Approved: ' : 'تمت الموافقة: ') + d.ip);
 });
 
 // ── Microphone ─────────────────────────────────────────────────────────────────
