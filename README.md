@@ -4,7 +4,7 @@
 
 **Control your PC from any device browser. No app needed.**
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 
@@ -15,18 +15,11 @@
 ## ⚠️ Official Source
 
 **The only official and verified release of PortDesk is hosted at:**  
-👉 `https://github.com/Lucky-abdo/PortDesk`
+👉 `https://github.com/Lucky_abdo/PortDesk`
 
 Copies or forks obtained from third-party websites, messaging groups, or unofficial links may have been modified. We cannot guarantee that such versions retain the same privacy standards, security model, or integrity as the original. Please exercise caution and always verify the source before running any code on your machine.
 
 ---
-
-### Lazy to read ?
-here is an prompt so ai concises it.
-
-```bash
-summary this file ,so i know how to install and run it and the important notices on the tool ,and no more than that
-```
 
 ## What is PortDesk?
 
@@ -38,26 +31,28 @@ Everything runs **locally on your machine**. Nothing is sent to the internet. Ev
 
 ## Quick Start
 
-### 1. Install python
-(and adb but its optional)
-
-### 2. Install dependencies
+### 1. Install dependencies
 
 ```bash
-python -m pip install -r requirements.txt
+pip install fastapi uvicorn pyautogui opencv-python mss psutil pyperclip sounddevice numpy Pillow python-multipart
 ```
 
-### 3. Run the server 
-**better run it by start file
-
-** run gen cert so the server runs on https rather than http
-
+**Optional (for better performance):**
 ```bash
-python gen_cert.py  # generates cert.pem and key.pem    
+pip install dxcam          # Windows only — faster screen capture via DirectX
+pip install PyTurboJPEG    # faster JPEG encoding
+pip install aiortc         # WebRTC support
+pip install cryptography   # for HTTPS/SSL
 ```
 
-**portdesk-server.py auto-detects the certificates and starts HTTPS
+### 2. Run the server
 
+# (recomended) run it by start file
+
+or
+```bash
+python portdesk-server.py
+```
 
 You'll see something like:
 ```
@@ -69,58 +64,46 @@ You'll see something like:
 ══════════════════════════════════════════════════
 ```
 
-### 4. Open on any device
+### 3. Open on any device
 
-- **WiFi:** Open `http://192.168.1.x:5000` in any browser on any device on the same network and Accept warning in the browser if showen.
+- **WiFi mode:** Open `http://192.168.1.x:5000` in any browser on any device on the same network
+** Open the IP shown in the terminal on any browser and it Works from phones, tablets, laptops, other PCs — anything with a browser
+## notice !!
+you have to Connect your device and PC to the same WiFi network . not guest network either data.
 
-- **USB (Android):** Run `adb reverse tcp:5000 tcp:5000` first, then open `http://localhost:5000`
+- **USB (Android) mode:** Enable USB Debugging on your Android device first, then Run `adb reverse tcp:5000 tcp:5000` then open `http://localhost:5000` in your browser
+
+## notice !!
+**Requires [ADB (Android Debug Bridge)](https://developer.android.com/tools/adb) installed on PC.**
+  > For non-Android devices (iPhone, iPad, laptop) just use WiFi mode — USB mode is Android-specific.  
+
+- **Hotspot Mode** (no router needed)
+You can use PortDesk without any WiFi router by creating a hotspot directly from your PC.
+
+**Windows:**
+1. Go to **Settings → Network → Mobile Hotspot** and turn it on
+2. Connect your phone to your PC's hotspot
+3. Run `portdesk-server.py` — the IP shown in the terminal will be your hotspot IP
+4. Open that IP in your phone's browser
+
+**Android tethering mode (reverse):**
+1. Enable USB tethering on your phone
+2. Run `adb reverse tcp:5000 tcp:5000`
+3. Open `http://localhost:5000` on your phone
 
 ---
 
-## 🐳 Docker (Linux Only)
+## HTTPS Setup (required for microphone)
 
-> Docker is recommended for Linux users who want to run PortDesk without installing Python or any dependencies manually.
-> 
-> **Not suitable for Windows or macOS** — PortDesk needs direct access to your screen, keyboard, and mouse, which Docker can only provide properly on Linux.
-
-### Pull and run
+The mobile microphone feature requires a secure connection (HTTPS).
 
 ```bash
-docker run -d \
-  --network=host \
-  -e DISPLAY=$DISPLAY \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
-  --device /dev/snd \
-  luckyabdo/portdesk:latest
+python gen_cert.py     # generates cert.pem and key.pem
+python portdesk-server.py   # auto-detects the certificates and starts HTTPS
 ```
 
-Then open `http://localhost:5000` in your browser or on any device on the same network.
-
----
-
-## Connection Modes
-
-### WiFi Mode
-- Connect your device and PC to the same WiFi network
-** make sure it's the main wifi network, not guest either data wifi
-  
-- Open the IP shown in the terminal on any browser
-- Works from phones, tablets, laptops, other PCs — anything with a browser
-- Slight latency possible over WiFi
-
-### USB Mode — Android (fastest)
-Requires [ADB (Android Debug Bridge)](https://developer.android.com/tools/adb) installed on PC.
-
-```bash
-# Enable USB Debugging on your Android device first, then:
-adb reverse tcp:5000 tcp:5000
-```
-
-Then open `http://localhost:5000` on your device.
-
-> For non-Android devices (iPhone, iPad, laptop) just use WiFi mode — USB mode is Android-specific.  
-
-**USB mode may occur some latency.
+Then use `https://` instead of `http://` when opening on your device.  
+Accept the self-signed certificate warning in the browser.
 
 ---
 
@@ -183,7 +166,7 @@ Mirror your PC screen to your device.
 - Cursor color customization
 - Touchpad and keyboard available while viewing
 
-> Requires `opencv-python` or `Pillow`. For best performance install `opencv-python`.
+> On Windows, install `dxcam` for best performance (`pip install dxcam`). Falls back to `opencv-python` or `Pillow` automatically.
 
 ### 📁 Explorer Tab
 Browse, manage, and transfer files between your device and PC.
@@ -255,16 +238,14 @@ PortDesk is designed for local network use only. It has a built-in IP whitelist 
 - Whitelisted devices connect automatically in the future
 
 **Manage the whitelist from the phone:**
-- Settings → Add this device to whitelist (sends approval request to server console)
-- Settings → Remove myself from whitelist (removes only your own device)
-- A device rejected 3 times from the server console is automatically blacklisted
-- The server owner can remove a device from the blacklist via localhost only
+- Settings → Add this device to whitelist (adds current phone)
+- Settings → Clear whitelist (reset — all devices must re-request access)
 
 **PIN Lock:**
 - Settings → Set PIN — set a 4-digit PIN
 - Anyone opening the URL must enter it before accessing the controller
 - PIN is stored as a salted SHA-256 hash in the browser, never sent to the server in plain text
-- After 5 wrong attempts, the server locks the IP with an escalating lockout: 60 seconds on the 1st lockout, 180 seconds on the 2nd, and 300 seconds (fixed) from the 3rd onward
+- After 5 wrong attempts, the server locks the IP for 60 seconds
 
 ---
 
@@ -303,8 +284,6 @@ Uses your device's microphone as a virtual mic on the PC.
 ## Known Limitations
 
 - Screen mirroring FPS depends on your network speed and PC performance
-- Install `pyturbojpeg` for significantly better screen streaming performance: `pip install pyturbojpeg`
-- **Python 3.14 is not supported** — use Python 3.11 or 3.12
 - Mobile microphone requires HTTPS (generate a certificate first)
 - Remote audio on macOS has limited support
 - Gyroscope on iOS requires user permission (browser will ask on first use)
@@ -316,11 +295,12 @@ Uses your device's microphone as a virtual mic on the PC.
 
 | File | Description |
 |---|---|
-| `portdesk-server.py` | The Flask server — run this on your PC |
+| `portdesk-server.py` | The FastAPI server — run this on your PC |
 | `portdesk_client.html` | The phone UI — served automatically by the server |
 | `gen_cert.py` | Generates self-signed SSL certificate for HTTPS |
+| `fixer.py` | Diagnostics and auto-repair tool |
 | `requirements.txt` | Python dependencies |
-| `portdesk_security.json` | Whitelist & blacklist (auto-created, not in repo) |
+| `portdesk_security.json` | Whitelist (auto-created, not in repo) |
 | `portdesk_macros.json` | Saved macros (auto-created) |
 | `portdesk_scheduled.json` | Scheduled tasks (auto-created) |
 | `portdesk_events.log` | Server event log (auto-created) |
@@ -329,7 +309,7 @@ Uses your device's microphone as a virtual mic on the PC.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+MIT + Commons Clause License — see [LICENSE](LICENSE)
 
 ---
 
