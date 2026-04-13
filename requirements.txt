@@ -21,6 +21,11 @@ python-multipart>=0.0.6
 #                    pip install PyTurboJPEG
 # aiortc           — WebRTC support for screen streaming
 #                    pip install aiortc
+# FFmpeg           — H264 hardware encoding (h264_amf / h264_nvenc / h264_qsv)
+#                    Windows: winget install ffmpeg
+#                    Linux:   sudo apt install ffmpeg
+#                    macOS:   brew install ffmpeg
+#                    Without FFmpeg, streaming falls back to JPEG mode automatically.
 
 # ── Optional (features) ───────────────────────────────────────────────────────
 # python-uinput    — Virtual keyboard on Linux (requires root)
