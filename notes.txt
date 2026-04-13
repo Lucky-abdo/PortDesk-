@@ -67,19 +67,27 @@ PortDesk uses a command-line approval system to control which devices can connec
 
 The following issues are known and may be encountered in the current release. Please follow the latest updates on GitHub for fixes:
 
-- **WebSocket on Python 3.14**: Flask-SocketIO does not work correctly with Werkzeug on Python 3.14. It is recommended to use **Python 3.11 or 3.12**.
+- **WebSocket on Python 3.14**: some asyncio behavior changed in 3.14. It is recommended to use **Python 3.11 or 3.12**.
 - **Screen streaming sharpness**: Quality may vary between devices depending on screen DPR (Device Pixel Ratio) and the client browser's rendering capabilities. This is partially addressed in the current version but may still vary.
+- **H264 streaming**: Requires FFmpeg installed and available in PATH. Without FFmpeg, streaming falls back to JPEG mode automatically. Hardware encoding (h264_amf, h264_nvenc, h264_qsv) is auto-detected at startup — a log message confirms which encoder is active.
 - **Keyboard input on some Windows setups**: May require running the server as Administrator.
 - **Gyroscope control**: Requires HTTPS to be enabled (run `gen_cert.py` first).
 - **Mobile microphone**: Only works over HTTPS.
 - **dxcam on multi-monitor**: The camera instance is created once for a fixed monitor index. Switching monitors while streaming requires a server restart to reinitialize dxcam.
-- **WebRTC fallback**: If WebRTC negotiation fails (e.g., browser incompatibility), the server automatically falls back to WebSocket-based streaming. WebRTC requires the browser to support `RTCPeerConnection` and `getStats()`.
 
 > For the latest fixes and updates, always check: **https://github.com/Lucky-abdo/PortDesk**
 
 ---
 
 ## Screen Streaming — Performance & Latency
+
+### Streaming Modes
+PortDesk supports two streaming modes selected automatically at startup:
+
+- **H264 mode** (default when FFmpeg is installed): Hardware-encoded H264 stream delivered via WebSocket and decoded in the browser using MSE (Media Source Extensions). Significantly lower bandwidth and better quality at high FPS. Requires FFmpeg in PATH. Hardware encoder is auto-detected (h264_amf → h264_nvenc → h264_qsv → libx264 fallback).
+- **JPEG mode** (fallback): Individual JPEG frames sent over WebSocket with delta-patch optimization. Works without FFmpeg. Higher bandwidth, slightly higher CPU usage.
+
+The active mode is shown in the server console at streaming start.
 
 ### Streaming Quality
 The visual quality of the stream can differ across client devices even with identical server settings. This is influenced by:
@@ -235,9 +243,11 @@ The ping between the client and the PortDesk server (e.g., for mouse/keyboard co
 الكلايانت يقدر يشيل نفسه بس من القايمة البيضا من الإعدادات — ومينفعش يعدل القايمة البيضا أو السودا.
 
 مشاكل معروفة في النسخة الحالية
-WebSocket على Python 3.14: مش شغال صح. استخدم Python 3.11 أو 3.12.
+WebSocket على Python 3.14: بعض سلوكيات asyncio اتغيرت في 3.14. استخدم Python 3.11 أو 3.12.
 
 جودة البث: ممكن تختلف بين الأجهزة حسب الـ DPR وقدرة المتصفح على الرندرة. حتى لو إعدادات السيرفر واحدة، الجودة ممكن تتفاوت من جهاز للتاني.
+
+بث H264: يحتاج FFmpeg مثبت ومتاح في الـ PATH. من غيره، البث بيرجع تلقائياً لوضع JPEG. الـ hardware encoding (h264_amf أو h264_nvenc أو h264_qsv) بيتكتشف تلقائياً عند بدء التشغيل ورسالة في الكوماند بتأكد الـ encoder المستخدم.
 
 الكيبورد على بعض إعدادات Windows: ممكن يحتاج تشغيل السيرفر كـ Administrator.
 
@@ -246,8 +256,6 @@ WebSocket على Python 3.14: مش شغال صح. استخدم Python 3.11 أو 
 ميكروفون الموبايل: يشتغل بس على HTTPS.
 
 dxcam مع شاشات متعددة: الـ camera instance بيتعمل مرة واحدة عند أول تشغيل للبث. لو غيرت الشاشة المختارة وفيه مشاكل، أعد تشغيل السيرفر.
-
-WebRTC fallback: لو WebRTC فشل (مثلاً المتصفح مش بيدعمه)، السيرفر بيرجع تلقائياً للـ WebSocket streaming. WebRTC بيحتاج المتصفح يدعم RTCPeerConnection وgetStats().
 
 لمتابعة آخر التحديثات والإصلاحات: https://github.com/Lucky-abdo/PortDesk
 
