@@ -60,10 +60,8 @@ pyautogui.PAUSE    = 0
 _pyautogui_lock = threading.Lock()
 _sec_lock       = threading.Lock()
 
-# ── Event loop reference (set on startup) ─────────────────────────────────────
 _loop: asyncio.AbstractEventLoop = None
 
-# ── WebSocket Connection Manager ──────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
@@ -106,7 +104,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ── Security ──────────────────────────────────────────────────────────────────
 def _load_security():
     try:
         with open(SECURITY_FILE) as f: return json.load(f)
@@ -148,7 +145,6 @@ def _prompt_add_ip(ip):
     print('═'*50, flush=True)
     manager.broadcast_sync({'type': 'ip_request', 'ip': ip, 'attempt': count})
 
-# ── HTTP Security Middleware ───────────────────────────────────────────────────
 class SecurityMiddleware(BaseHTTPMiddleware):
     OPEN_PATHS = {'/security/whitelist/request', '/security/whitelist/remove_self'}
 
@@ -173,7 +169,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-# ── App ───────────────────────────────────────────────────────────────────────
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -192,6 +187,7 @@ async def _lifespan(app):
             print("✅ Virtual keyboard initialized.")
         else:
             print("⚠️ Virtual keyboard not available; using fallbacks.")
+    threading.Thread(target=_detect_ffmpeg_encoder, daemon=True).start()
     yield
     global _dxcam_camera
     with _dxcam_camera_lock:
@@ -204,7 +200,6 @@ app = FastAPI(lifespan=_lifespan)
 app.add_middleware(SecurityMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── CoreTemp ──────────────────────────────────────────────────────────────────
 class _CoreTempData(ctypes.Structure):
     _fields_ = [
         ("uiLoad",         ctypes.c_uint  * 256),
@@ -282,7 +277,6 @@ def get_system_stats():
     if gpu_t: stats["gpu_temp"] = gpu_t
     return stats
 
-# ── Key Mapping ───────────────────────────────────────────────────────────────
 KEY_MAP = {
     'win':'winleft','windows':'winleft','super':'winleft',
     'cmd':'command','command':'command',
@@ -312,7 +306,6 @@ def type_text(text):
             try: pyautogui.write(text, interval=0.02)
             except Exception as e: print(f"❌ type_text: {e}")
 
-# ── Virtual Keyboard ──────────────────────────────────────────────────────────
 _virtual_kb_device = None
 
 def _init_virtual_keyboard():
@@ -373,7 +366,6 @@ def _send_xdotool_text(text):
         try: subprocess.run(['xdotool', 'type', '--clearmodifiers', text], check=True)
         except Exception as e: print(f"xdotool text failed: {e}")
 
-# ── Screen Streaming ──────────────────────────────────────────────────────────
 screen_streaming   = False
 screen_thread      = None
 _screen_last_error = ''
@@ -398,6 +390,190 @@ stream_config = {
     'monitor': 1, 'cursor_color_bgr': (255, 255, 255)
 }
 _stream_config_lock = threading.Lock()
+
+_ffmpeg_encoder    = None
+_ffmpeg_encoder_ok = False
+
+def _detect_ffmpeg_encoder():
+    global _ffmpeg_encoder, _ffmpeg_encoder_ok
+    import shutil
+    if not shutil.which('ffmpeg'):
+        print("⚠ FFmpeg not found in PATH — hardware encoding unavailable")
+        return None
+    if not CV2_AVAILABLE:
+        return None
+
+    sys_name = platform.system()
+    if sys_name == 'Windows':
+        candidates = [
+            ('h264_nvenc', ['-preset', 'p1', '-tune', 'll', '-bf', '0']),
+            ('h264_amf',   ['-quality', 'speed', '-bf', '0']),
+            ('h264_qsv',   ['-preset', 'veryfast', '-bf', '0']),
+            ('libx264',    ['-preset', 'ultrafast', '-tune', 'zerolatency', '-bf', '0']),
+        ]
+    elif sys_name == 'Linux':
+        candidates = [
+            ('h264_nvenc', ['-preset', 'p1', '-tune', 'll', '-bf', '0']),
+            ('h264_vaapi', []),
+            ('libx264',    ['-preset', 'ultrafast', '-tune', 'zerolatency', '-bf', '0']),
+        ]
+    elif sys_name == 'Darwin':
+        candidates = [
+            ('h264_videotoolbox', ['-realtime', '1', '-bf', '0']),
+            ('libx264',           ['-preset', 'ultrafast', '-tune', 'zerolatency', '-bf', '0']),
+        ]
+    else:
+        candidates = [('libx264', ['-preset', 'ultrafast', '-tune', 'zerolatency', '-bf', '0'])]
+
+    dummy_frame = np.zeros((64, 64, 3), dtype=np.uint8).tobytes()
+
+    for enc, enc_flags in candidates:
+        try:
+            if enc == 'h264_vaapi':
+                cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-vaapi_device', '/dev/dri/renderD128',
+                    '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', '64x64', '-r', '1',
+                    '-i', 'pipe:0',
+                    '-vf', 'format=nv12,hwupload',
+                    '-vcodec', 'h264_vaapi',
+                    '-frames:v', '1', '-f', 'null', '-'
+                ]
+            else:
+                cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', '64x64', '-r', '1',
+                    '-i', 'pipe:0',
+                    '-vcodec', enc,
+                ] + enc_flags + ['-frames:v', '1', '-f', 'null', '-']
+
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, _ = proc.communicate(input=dummy_frame, timeout=8)
+            if proc.returncode == 0:
+                _ffmpeg_encoder    = enc
+                _ffmpeg_encoder_ok = True
+                hw = enc != 'libx264'
+                print(f"✅ FFmpeg encoder: {enc} ({'hardware' if hw else 'software fallback'})")
+                return enc
+            else:
+                print(f"  ↳ {enc}: not available")
+        except FileNotFoundError:
+            print("⚠ FFmpeg not found"); return None
+        except Exception as e:
+            print(f"  ↳ {enc}: {e}"); continue
+
+    print("⚠ FFmpeg: no encoder detected")
+    return None
+
+
+class _FfmpegH264Streamer:
+    MSG_H264 = 0x03
+
+    def __init__(self, encoder, width, height, fps):
+        self.encoder  = encoder
+        self.width    = width
+        self.height   = height
+        self.fps      = max(1, fps)
+        self.proc     = None
+        self._running = False
+        self._reader  = None
+
+    def _build_cmd(self):
+        enc = self.encoder
+        fps = self.fps
+        gop = fps * 2
+
+        base = [
+            'ffmpeg', '-y', '-loglevel', 'error',
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(fps),
+            '-i', 'pipe:0',
+        ]
+
+        if enc == 'h264_nvenc':
+            enc_args = ['-vcodec', 'h264_nvenc', '-preset', 'p1',
+                        '-tune', 'll', '-zerolatency', '1', '-bf', '0', '-g', str(gop)]
+        elif enc == 'h264_amf':
+            enc_args = ['-vcodec', 'h264_amf', '-quality', 'speed',
+                        '-rc', 'cbr', '-bf', '0', '-g', str(gop)]
+        elif enc == 'h264_qsv':
+            enc_args = ['-vcodec', 'h264_qsv', '-preset', 'veryfast',
+                        '-bf', '0', '-g', str(gop)]
+        elif enc == 'h264_videotoolbox':
+            enc_args = ['-vcodec', 'h264_videotoolbox', '-realtime', '1',
+                        '-bf', '0', '-g', str(gop)]
+        elif enc == 'h264_vaapi':
+            base = [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-vaapi_device', '/dev/dri/renderD128',
+                '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+                '-s', f'{self.width}x{self.height}',
+                '-r', str(fps), '-i', 'pipe:0',
+            ]
+            enc_args = ['-vf', 'format=nv12,hwupload',
+                        '-vcodec', 'h264_vaapi', '-bf', '0', '-g', str(gop)]
+        else:
+            enc_args = ['-vcodec', 'libx264', '-preset', 'ultrafast',
+                        '-tune', 'zerolatency', '-bf', '0', '-g', str(gop)]
+
+        out = ['-f', 'mp4',
+               '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+               'pipe:1']
+        return base + enc_args + out
+
+    def start(self):
+        self._running = True
+        try:
+            self.proc = subprocess.Popen(
+                self._build_cmd(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0
+            )
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+            return True
+        except Exception as e:
+            print(f"❌ H264Streamer start: {e}")
+            self._running = False
+            return False
+
+    def _read_loop(self):
+        CHUNK = 16384
+        while self._running:
+            try:
+                data = self.proc.stdout.read(CHUNK)
+                if not data:
+                    break
+                if _loop and not _loop.is_closed():
+                    msg = struct.pack('>BI', self.MSG_H264, len(data)) + data
+                    asyncio.run_coroutine_threadsafe(
+                        manager.broadcast_bytes(msg), _loop
+                    )
+            except Exception as e:
+                if self._running:
+                    print(f"❌ H264Streamer read: {e}")
+                break
+
+    def send_frame(self, frame_bgr):
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write(frame_bgr.tobytes())
+            self.proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def close(self):
+        self._running = False
+        if self.proc:
+            try: self.proc.stdin.close()
+            except: pass
+            try: self.proc.terminate()
+            except: pass
+            self.proc = None
 
 _mouse_pos      = (0, 0)
 _mouse_pos_lock = threading.Lock()
@@ -425,22 +601,51 @@ def _draw_cursor(arr, mx, my, mon_left, mon_top, src_w, src_h, cursor_color):
 def screen_worker():
     global screen_streaming, _screen_last_error
     _screen_last_error = ''
-    tj = None; use_turbo = False
-
-    try:
-        from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_444 as _TJSAMP_444
-        tj, use_turbo = TurboJPEG(), True
-        _TJPF_BGR = TJPF_BGR
-        print("✅ screen: TurboJPEG active")
-    except Exception as _te:
-        print(f"⚠ screen: TurboJPEG not available ({_te}), falling back to cv2")
 
     if not (MSS_AVAILABLE or DXCAM_AVAILABLE):
         _screen_last_error = 'no capture backend available'; return
-    if not CV2_AVAILABLE and not use_turbo:
+    if not CV2_AVAILABLE:
         _screen_last_error = 'cv2 not available'; return
 
-    _pipe      = _queue.Queue(maxsize=1)
+    with _stream_config_lock: cfg0 = stream_config.copy()
+    use_h264 = _ffmpeg_encoder_ok and _ffmpeg_encoder is not None
+
+    if use_h264:
+        target_h = cfg0['height']
+        fps      = max(1, cfg0['fps'])
+        with _mss.mss() as _sct0:
+            mon0   = _sct0.monitors[max(1, min(cfg0['monitor'], len(_sct0.monitors)-1))]
+            src_w0 = mon0['width']; src_h0 = mon0['height']
+        target_w = int(src_w0 * target_h / src_h0)
+        target_w = target_w if target_w % 2 == 0 else target_w + 1
+        target_h = target_h if target_h % 2 == 0 else target_h + 1
+
+        h264 = _FfmpegH264Streamer(_ffmpeg_encoder, target_w, target_h, fps)
+        if not h264.start():
+            use_h264 = False
+            print("⚠ H264 streamer failed to start — falling back to JPEG")
+        else:
+            print(f"✅ screen: H264 via {_ffmpeg_encoder} ({target_w}x{target_h} @ {fps}fps)")
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast({'type': 'stream_mode', 'mode': 'h264',
+                                   'encoder': _ffmpeg_encoder,
+                                   'width': target_w, 'height': target_h}), _loop
+            )
+
+    if not use_h264:
+        tj = None; use_turbo = False
+        try:
+            from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_444 as _TJSAMP_444
+            tj, use_turbo = TurboJPEG(), True
+            _TJPF_BGR = TJPF_BGR
+            print("✅ screen: TurboJPEG active")
+        except Exception as _te:
+            print(f"⚠ screen: TurboJPEG not available ({_te}), falling back to cv2")
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast({'type': 'stream_mode', 'mode': 'jpeg'}), _loop
+        )
+
+    _pipe      = asyncio.Queue(maxsize=1)
     fps_frames = 0
     fps_t      = time.perf_counter()
 
@@ -487,53 +692,71 @@ def screen_worker():
         x1 = min(int(dc[-1]+1) * block, W) - 1
         return x0, y0, x1, y1
 
-    def _encode_emit():
+    async def _encode_emit():
         nonlocal fps_frames, fps_t, _prev_arr, _frame_ctr
+        loop = asyncio.get_running_loop()
         while screen_streaming:
             try:
-                item = _pipe.get(timeout=0.1)
-                if item is None: break
-                arr, cfg_snap = item
-                q = cfg_snap.get('quality', 65)
-                H, W = arr.shape[:2]
-                _frame_ctr += 1
-                force = (_frame_ctr % FORCE_EVERY == 1) or (_prev_arr is None) or (_prev_arr.shape != arr.shape)
+                item = await asyncio.wait_for(_pipe.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            if item is None:
+                break
+            arr, cfg_snap = item
 
-                if force:
-                    jpeg = _encode_jpeg(arr, q)
-                    if jpeg: manager.broadcast_bytes_sync(_msg_full(W, H, jpeg))
-                else:
-                    bbox = _dirty_bbox(arr, _prev_arr, BLOCK)
-                    if bbox is None:
-                        _prev_arr = arr
-                        fps_frames += 1
-                        now = time.perf_counter()
-                        if now - fps_t >= 1.0:
-                            manager.broadcast_sync({'type': 'fps_update', 'fps': round(fps_frames / (now - fps_t), 1)})
-                            fps_frames = 0; fps_t = now
-                        continue
-                    x0, y0, x1, y1 = bbox
-                    pw_p, ph_p = x1 - x0 + 1, y1 - y0 + 1
-                    if (pw_p * ph_p) / (W * H) > PATCH_LIMIT:
-                        jpeg = _encode_jpeg(arr, q)
-                        if jpeg: manager.broadcast_bytes_sync(_msg_full(W, H, jpeg))
-                    else:
-                        jpeg = _encode_jpeg(arr[y0:y1+1, x0:x1+1], q)
-                        if jpeg: manager.broadcast_bytes_sync(_msg_patch(W, H, x0, y0, pw_p, ph_p, jpeg))
-
-                _prev_arr = arr
+            if use_h264:
+                ok = await loop.run_in_executor(None, h264.send_frame, arr)
+                if not ok:
+                    print("⚠ H264 send_frame failed"); break
                 fps_frames += 1
                 now = time.perf_counter()
                 if now - fps_t >= 1.0:
-                    manager.broadcast_sync({'type': 'fps_update', 'fps': round(fps_frames / (now - fps_t), 1)})
+                    await manager.broadcast({'type': 'fps_update', 'fps': round(fps_frames / (now - fps_t), 1)})
                     fps_frames = 0; fps_t = now
-            except _queue.Empty:
                 continue
-            except Exception as e:
-                print(f"❌ encode_emit: {e}")
 
-    emit_thread = threading.Thread(target=_encode_emit, daemon=True)
-    emit_thread.start()
+            q  = cfg_snap.get('quality', 65)
+            H, W = arr.shape[:2]
+            _frame_ctr += 1
+            force = (_frame_ctr % FORCE_EVERY == 1) or (_prev_arr is None) or (_prev_arr.shape != arr.shape)
+
+            if force:
+                jpeg = await loop.run_in_executor(None, _encode_jpeg, arr, q)
+                if jpeg:
+                    await manager.broadcast_bytes(_msg_full(W, H, jpeg))
+            else:
+                bbox = await loop.run_in_executor(None, _dirty_bbox, arr, _prev_arr, BLOCK)
+                if bbox is None:
+                    _prev_arr = arr
+                    continue
+                x0, y0, x1, y1 = bbox
+                pw_p, ph_p = x1 - x0 + 1, y1 - y0 + 1
+                if (pw_p * ph_p) / (W * H) > PATCH_LIMIT:
+                    jpeg = await loop.run_in_executor(None, _encode_jpeg, arr, q)
+                    if jpeg:
+                        await manager.broadcast_bytes(_msg_full(W, H, jpeg))
+                else:
+                    patch = arr[y0:y1+1, x0:x1+1]
+                    jpeg  = await loop.run_in_executor(None, _encode_jpeg, patch, q)
+                    if jpeg:
+                        await manager.broadcast_bytes(_msg_patch(W, H, x0, y0, pw_p, ph_p, jpeg))
+
+            _prev_arr = arr
+            fps_frames += 1
+            now = time.perf_counter()
+            if now - fps_t >= 1.0:
+                await manager.broadcast({'type': 'fps_update', 'fps': round(fps_frames / (now - fps_t), 1)})
+                fps_frames = 0; fps_t = now
+
+    emit_future = asyncio.run_coroutine_threadsafe(_encode_emit(), _loop)
+
+    # ── helper: put frame into asyncio queue from capture thread ─────────────
+    def _put_frame(arr, cfg):
+        if not _pipe.empty():
+            try: _pipe.get_nowait()
+            except: pass
+        try: _pipe.put_nowait((arr, cfg))
+        except: pass
 
     use_dxcam = DXCAM_AVAILABLE and platform.system() == 'Windows' and CV2_AVAILABLE
 
@@ -576,11 +799,7 @@ def screen_worker():
                         _draw_cursor(arr, mx, my, mon['left'], mon['top'], src_w, src_h,
                                      cfg.get('cursor_color_bgr', (255, 255, 255)))
 
-                        if _pipe.full():
-                            try: _pipe.get_nowait()
-                            except: pass
-                        try: _pipe.put_nowait((arr, cfg))
-                        except: pass
+                        _loop.call_soon_threadsafe(_put_frame, arr, cfg)
 
                         elapsed = time.perf_counter() - t0
                         sleep_t = frame_budget - elapsed
@@ -617,11 +836,7 @@ def screen_worker():
                         _draw_cursor(arr, mx, my, mon['left'], mon['top'], w, h,
                                      cfg.get('cursor_color_bgr', (255, 255, 255)))
 
-                        if _pipe.full():
-                            try: _pipe.get_nowait()
-                            except: pass
-                        try: _pipe.put_nowait((arr, cfg))
-                        except: pass
+                        _loop.call_soon_threadsafe(_put_frame, arr, cfg)
 
                         elapsed = time.perf_counter() - t0
                         sleep_t = frame_budget - elapsed
@@ -631,13 +846,16 @@ def screen_worker():
         except Exception as e:
             _screen_last_error = str(e); print(f"❌ screen_worker: {e}")
 
-    try: _pipe.put_nowait(None)
+    try: _loop.call_soon_threadsafe(_pipe.put_nowait, None)
     except: pass
-    emit_thread.join(timeout=2)
+    try: emit_future.result(timeout=2)
+    except: pass
+    if use_h264:
+        try: h264.close()
+        except: pass
     if _screen_last_error:
         manager.broadcast_sync({'type': 'screen_error', 'msg': _screen_last_error})
 
-# ── WebRTC Screen Track ────────────────────────────────────────────────────────
 if WEBRTC_AVAILABLE:
     from fractions import Fraction as _Fraction
 
@@ -712,7 +930,6 @@ if WEBRTC_AVAILABLE:
 
 _webrtc_pcs: set = set()
 
-# ── Mic ───────────────────────────────────────────────────────────────────────
 _mic_queue  = _queue.Queue(maxsize=40)
 _mic_active = False
 _mic_worker_thread = None
@@ -742,7 +959,6 @@ def _mic_worker():
         stream.stop(); stream.close()
     except Exception as e: print(f"mic_worker: {e}")
 
-# ── Audio ─────────────────────────────────────────────────────────────────────
 audio_streaming = False
 _audio_thread   = None
 _AUDIO_CHUNK    = 4096
@@ -769,7 +985,6 @@ def _audio_worker():
     except Exception as e:
         print(f"❌ audio_worker: {e}"); audio_streaming = False
 
-# ── Clipboard Watcher ─────────────────────────────────────────────────────────
 _last_clip    = ""
 _clip_lock    = threading.Lock()
 _clip_running = False
@@ -790,7 +1005,6 @@ def _clipboard_watcher():
         except: pass
         time.sleep(2)
 
-# ── Stats Push ────────────────────────────────────────────────────────────────
 def _stats_pusher():
     while True:
         time.sleep(5)
@@ -799,7 +1013,6 @@ def _stats_pusher():
             manager.broadcast_sync({'type': 'stats_push', **stats})
         except: pass
 
-# ── Event Log ─────────────────────────────────────────────────────────────────
 LOG_FILE  = os.path.join(BASE_DIR, "portdesk_events.log")
 _log_lock = threading.Lock()
 
@@ -809,7 +1022,6 @@ def _log_event(event_type, detail='', ip='system'):
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
 
-# ── Windows shortcut helpers ──────────────────────────────────────────────────
 def _press_win_shortcut(keys):
     system = platform.system()
     try:
@@ -841,7 +1053,6 @@ def _press_win_shortcut(keys):
     except Exception as e:
         print(f"win shortcut error: {e}"); return False
 
-# ── Scheduled Tasks ───────────────────────────────────────────────────────────
 SCHED_FILE    = os.path.join(BASE_DIR, "portdesk_scheduled.json")
 _sched_lock   = threading.Lock()
 _sched_thread = None
@@ -904,14 +1115,12 @@ def _scheduler_worker():
                         _log_event('sched_run', macro_name)
         time.sleep(10)
 
-# ── Brute Force ───────────────────────────────────────────────────────────────
 _pin_fails        = defaultdict(int)
 _pin_lockout      = {}
 _pin_lockout_count = defaultdict(int)
 PIN_MAX_TRIES      = 5
 PIN_LOCKOUT_STEPS  = [60, 180, 300]
 
-# ── Linux Compat ──────────────────────────────────────────────────────────────
 def _check_linux_compatibility():
     if platform.system() != 'Linux': return []
     errors = []
@@ -927,7 +1136,6 @@ def _check_linux_compatibility():
         errors.append('xdotool not installed; virtual keyboard may be slower or unavailable on Linux.')
     return errors
 
-# ── WebSocket Dispatcher ──────────────────────────────────────────────────────
 async def _dispatch(data: dict, ws: WebSocket):
     global screen_streaming, screen_thread, _mic_active, _mic_worker_thread, audio_streaming, _audio_thread
     t  = data.get('_ev', data.get('type', ''))
@@ -1082,7 +1290,6 @@ async def _dispatch(data: dict, ws: WebSocket):
         audio_streaming = False
         _log_event('audio_stop', ip=ip)
 
-# ── WebSocket Endpoint ────────────────────────────────────────────────────────
 @app.websocket('/ws')
 async def websocket_endpoint(ws: WebSocket):
     global screen_streaming, audio_streaming, _mic_active
@@ -1117,7 +1324,6 @@ async def websocket_endpoint(ws: WebSocket):
                 with _pyautogui_lock: pyautogui.keyUp(mod)
             except: pass
 
-# ── WebRTC Offer ──────────────────────────────────────────────────────────────
 @app.post('/webrtc/offer')
 async def webrtc_offer(request: Request):
     if not WEBRTC_AVAILABLE:
@@ -1145,7 +1351,6 @@ async def webrtc_offer(request: Request):
         _webrtc_pcs.discard(pc)
         return JSONResponse({'error': str(e)}, status_code=500)
 
-# ── HTTP Routes ───────────────────────────────────────────────────────────────
 @app.get('/')
 async def index(request: Request):
     path = os.path.join(BASE_DIR, 'portdesk_client.html')
@@ -1533,6 +1738,15 @@ async def macros_run(request: Request):
     threading.Thread(target=_run, daemon=True).start()
     return {'ok': True}
 
+@app.get('/stream/encoder_info')
+async def stream_encoder_info():
+    return {
+        'ffmpeg_encoder': _ffmpeg_encoder,
+        'hardware':       _ffmpeg_encoder not in (None, 'libx264'),
+        'mode':           'h264' if _ffmpeg_encoder_ok else 'jpeg',
+        'platform':       platform.system(),
+    }
+
 @app.get('/monitors/list')
 async def monitors_list():
     if not MSS_AVAILABLE: return []
@@ -1665,13 +1879,22 @@ async def scheduled_toggle(request: Request):
         _save_scheduled(scheduled_tasks)
     return {'ok': True}
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+
+# ── TCP_NODELAY custom uvicorn server ─────────────────────────────────────────
+import uvicorn as _uvicorn
+
+class _NoDelayServer(_uvicorn.Server):
+    async def startup(self, sockets=None):
+        await super().startup(sockets)
+        for server in self.servers:
+            for sock in server.sockets:
+                try:
+                    sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    import uvicorn
-
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80)); local_ip = s.getsockname()[0]; s.close()
@@ -1703,6 +1926,9 @@ if __name__ == '__main__':
     sys.stdout.flush()
 
     if use_https:
-        uvicorn.run(app, host='0.0.0.0', port=5000, ssl_certfile=cert_file, ssl_keyfile=key_file, log_level='warning')
+        cfg = _uvicorn.Config(app, host='0.0.0.0', port=5000,
+                              ssl_certfile=cert_file, ssl_keyfile=key_file, log_level='warning')
     else:
-        uvicorn.run(app, host='0.0.0.0', port=5000, log_level='warning')
+        cfg = _uvicorn.Config(app, host='0.0.0.0', port=5000, log_level='warning')
+
+    _NoDelayServer(cfg).run()
