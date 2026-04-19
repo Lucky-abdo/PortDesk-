@@ -7,7 +7,14 @@ from collections import defaultdict
 import sys, io, asyncio, json, os, time, ctypes, threading, logging, platform, struct
 import queue as _queue
 import string as _string
-import base64, subprocess
+import base64, subprocess, hashlib
+
+try:
+    import bcrypt as _bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    _bcrypt = None
+    BCRYPT_AVAILABLE = False
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
@@ -43,7 +50,7 @@ except ImportError:
     UINPUT_AVAILABLE = False
 
 try:
-    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
     from aiortc.contrib.media import MediaStreamTrack
     import av
     WEBRTC_AVAILABLE = True
@@ -54,6 +61,20 @@ SUBPROCESS_AVAILABLE = True
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 SECURITY_FILE = os.path.join(BASE_DIR, "portdesk_security.json")
 
+FLAG_WATCH_ONLY   = False
+FLAG_NO_EXPLORER  = False
+FLAG_NO_MOUSE     = False
+FLAG_NO_KEYBOARD  = False
+FLAG_NO_WEBRTC    = False
+FLAG_GREY         = False
+FLAG_SCALE        = 1.0
+FLAG_UPLOAD_LIMIT = None
+FLAG_BACKEND      = None
+FLAG_VERBOSE      = False
+
+def _vprint(*a, **kw):
+    if FLAG_VERBOSE: print(*a, **kw)
+
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE    = 0
 
@@ -62,15 +83,90 @@ _sec_lock       = threading.Lock()
 
 _loop: asyncio.AbstractEventLoop = None
 
+# ── Group 3: Token Bucket ─────────────────────────────────────────────────────
+class _TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate     = rate
+        self.capacity = capacity
+        self._tokens  = {}
+        self._last    = {}
+        self._lock    = threading.Lock()
+
+    def consume(self, key, tokens=1):
+        now = time.time()
+        with self._lock:
+            if key not in self._tokens:
+                self._tokens[key] = self.capacity
+                self._last[key]   = now
+            elapsed = now - self._last[key]
+            self._tokens[key] = min(self.capacity, self._tokens[key] + elapsed * self.rate)
+            self._last[key]   = now
+            if self._tokens[key] >= tokens:
+                self._tokens[key] -= tokens
+                return True
+        return False
+
+_ws_buckets = {
+    'move':         _TokenBucket(rate=150, capacity=200),
+    'scroll':       _TokenBucket(rate=60,  capacity=80),
+    'selector_move':_TokenBucket(rate=150, capacity=200),
+    'selector_start':_TokenBucket(rate=10, capacity=15),
+    'selector_end': _TokenBucket(rate=10,  capacity=15),
+    'click':        _TokenBucket(rate=20,  capacity=30),
+    'key':          _TokenBucket(rate=30,  capacity=40),
+    'key_down':     _TokenBucket(rate=80,  capacity=100),
+    'key_up':       _TokenBucket(rate=80,  capacity=100),
+    'type':         _TokenBucket(rate=20,  capacity=30),
+    'shortcut':     _TokenBucket(rate=15,  capacity=20),
+    'stream_config':_TokenBucket(rate=2,   capacity=5),
+    'set_monitor':  _TokenBucket(rate=2,   capacity=5),
+    'screen_start': _TokenBucket(rate=0.5, capacity=2),
+    'screen_stop':  _TokenBucket(rate=2,   capacity=4),
+    'mic_start':    _TokenBucket(rate=0.5, capacity=2),
+    'mic_stop':     _TokenBucket(rate=2,   capacity=4),
+    'mic_chunk':    _TokenBucket(rate=100, capacity=150),
+    'audio_start':  _TokenBucket(rate=0.5, capacity=2),
+    'audio_stop':   _TokenBucket(rate=2,   capacity=4),
+    'default':      _TokenBucket(rate=30,  capacity=50),
+}
+
+STUN_SERVERS = [
+    RTCIceServer(urls=['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'])
+] if WEBRTC_AVAILABLE else []
+
+_webrtc_pcs: set = set()
+
+_webrtc_dc_clients: list = []
+_webrtc_dc_lock           = threading.Lock()
+
+
+class _DataChannelClient:
+    _is_dc_client = True
+
+    def __init__(self, channel, host: str):
+        self.channel = channel
+        self.client  = type('_C', (), {'host': host})()
+
+    async def send_json(self, data: dict):
+        try:
+            if self.channel.readyState == 'open':
+                self.channel.send(json.dumps(data))
+        except Exception:
+            pass
+
+    async def send_bytes(self, data: bytes):
+        pass
+
+
 class ConnectionManager:
     def __init__(self):
-        self.active: list[WebSocket] = []
+        self.active = []
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
 
-    def disconnect(self, ws: WebSocket):
+    def disconnect(self, ws):
         if ws in self.active:
             self.active.remove(ws)
 
@@ -87,6 +183,8 @@ class ConnectionManager:
     async def broadcast_bytes(self, data: bytes):
         dead = []
         for ws in self.active:
+            if getattr(ws, '_is_dc_client', False):
+                continue
             try:
                 await ws.send_bytes(data)
             except Exception:
@@ -98,27 +196,103 @@ class ConnectionManager:
         if _loop and not _loop.is_closed() and _loop.is_running():
             asyncio.run_coroutine_threadsafe(self.broadcast(data), _loop)
 
+    async def broadcast_ws_only(self, data: dict):
+        dead = []
+        for ws in self.active:
+            if getattr(ws, '_is_dc_client', False):
+                continue
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+    def broadcast_ws_only_sync(self, data: dict):
+        if _loop and not _loop.is_closed() and _loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.broadcast_ws_only(data), _loop)
+
     def broadcast_bytes_sync(self, data: bytes):
         if _loop and not _loop.is_closed() and _loop.is_running():
             asyncio.run_coroutine_threadsafe(self.broadcast_bytes(data), _loop)
 
 manager = ConnectionManager()
 
+_SEC_BACKUP_COUNT = 3
+
+def _security_backup_path(n):
+    return f"{SECURITY_FILE}.bak{n}"
+
+def _load_security_from(path):
+    with open(path) as f:
+        d = json.load(f)
+    if "blacklist" not in d: d["blacklist"] = []
+    if "lockout"   not in d: d["lockout"]   = {}
+    if "pins"      not in d: d["pins"]       = {}
+    d.pop("pin_hash", None)
+    return d
+
 def _load_security():
-    try:
-        with open(SECURITY_FILE) as f: return json.load(f)
-    except: return {"whitelist": [], "blacklist": []}
+    for src in [SECURITY_FILE] + [_security_backup_path(n) for n in range(1, _SEC_BACKUP_COUNT + 1)]:
+        try:
+            d = _load_security_from(src)
+            if src != SECURITY_FILE:
+                print(f"  ⚠ Security file recovered from {os.path.basename(src)}", flush=True)
+            return d
+        except Exception:
+            continue
+    return {"whitelist": [], "blacklist": [], "pins": {}, "lockout": {}}
 
 def _save_security():
+    for n in range(_SEC_BACKUP_COUNT, 1, -1):
+        src = _security_backup_path(n - 1)
+        dst = _security_backup_path(n)
+        try:
+            if os.path.exists(src): os.replace(src, dst)
+        except Exception: pass
+    try:
+        if os.path.exists(SECURITY_FILE):
+            os.replace(SECURITY_FILE, _security_backup_path(1))
+    except Exception: pass
     tmp = SECURITY_FILE + '.tmp'
     with open(tmp, "w") as f: json.dump(security, f, indent=2)
     os.replace(tmp, SECURITY_FILE)
 
+def _restore_security_backup(n=1):
+    path = _security_backup_path(n)
+    if not os.path.exists(path):
+        return False, f"backup .bak{n} not found"
+    try:
+        d = _load_security_from(path)
+        with _sec_lock:
+            security.clear()
+            security.update(d)
+            _save_security()
+        _log_event('security_restore', detail=f"restored from .bak{n}", severity='WARNING')
+        return True, path
+    except Exception as e:
+        return False, str(e)
+
 security = _load_security()
 if "blacklist" not in security: security["blacklist"] = []
+if "pins"      not in security: security["pins"]      = {}
+if "lockout"   not in security: security["lockout"]   = {}
 
 _req_counts    = defaultdict(list)
 _reject_counts = defaultdict(int)
+
+# ── Restore persisted lockout state ──────────────────────────────────────────
+_pin_fails         = defaultdict(int)
+_pin_lockout       = {}
+_pin_lockout_count = defaultdict(int)
+PIN_MAX_TRIES      = 5
+PIN_LOCKOUT_STEPS  = [60, 180, 300]
+
+_now = time.time()
+for _ip, _ld in security.get("lockout", {}).items():
+    if isinstance(_ld, dict) and _ld.get("until", 0) > _now:
+        _pin_lockout[_ip]       = _ld["until"]
+        _pin_lockout_count[_ip] = _ld.get("count", 1)
 
 def _is_rate_limited(ip):
     now, window, limit = time.time(), 10, 50
@@ -133,41 +307,266 @@ def _is_allowed(ip):
     if ip in security.get("blacklist", []): return False
     return ip in security.get("whitelist", [])
 
-_pending_ips = set()
+_pending_ips = []
+_pending_ips_lock = threading.Lock()
+
+_lockdown         = False
+_lockdown_lock    = threading.Lock()
+
+_active_client_ws   = None
+_active_client_ip   = None
+_active_client_lock = threading.Lock()
+
+_unknown_attempts      = []
+_unknown_attempts_lock = threading.Lock()
+ATTACK_THRESHOLD       = 5
+ATTACK_WINDOW          = 30
+
+def _record_unknown_attempt(ip):
+    now = time.time()
+    with _unknown_attempts_lock:
+        _unknown_attempts.append((now, ip))
+        recent = [(t, i) for t, i in _unknown_attempts if now - t <= ATTACK_WINDOW]
+        _unknown_attempts[:] = recent
+        unique_ips = {i for _, i in recent}
+        if len(unique_ips) >= ATTACK_THRESHOLD:
+            return True
+    return False
+
+def _trigger_lockdown(reason=''):
+    global _lockdown, screen_streaming, audio_streaming, _mic_active
+    with _lockdown_lock:
+        if _lockdown: return
+        _lockdown = True
+    screen_streaming = False
+    audio_streaming  = False
+    _mic_active      = False
+    _log_event('lockdown', detail=reason, severity='CRITICAL')
+    print(f"\n{'█'*52}", flush=True)
+    print(f"  🚨 LOCKDOWN ACTIVATED — {reason}", flush=True)
+    print(f"  All clients kicked. New connections blocked.", flush=True)
+    print(f"  Type  lockdown off  to resume.", flush=True)
+    print(f"{'█'*52}\n", flush=True)
+    manager.broadcast_sync({'type': 'lockdown', 'reason': reason})
+    if _loop and not _loop.is_closed() and _loop.is_running():
+        asyncio.run_coroutine_threadsafe(_kick_all_clients(), _loop)
+
+async def _kick_all_clients():
+    for ws in list(manager.active):
+        try: await ws.close(1008)
+        except: pass
+    manager.active.clear()
+
+def _approve_ip(ip, action='allow'):
+    with _pending_ips_lock:
+        if ip in _pending_ips:
+            _pending_ips.remove(ip)
+    if action == 'allow':
+        with _sec_lock:
+            if ip not in security["whitelist"]:
+                security["whitelist"].append(ip)
+            _reject_counts[ip] = 0
+            security.get("pins", {}).pop(ip, None)
+            security.get("lockout", {}).pop(ip, None)
+            _save_security()
+        _pin_lockout.pop(ip, None)
+        _pin_fails[ip] = 0
+        _pin_lockout_count[ip] = 0
+        print(f"  ✅ Approved {ip}", flush=True)
+        manager.broadcast_sync({'type': 'ip_approved', 'ip': ip})
+    else:
+        _reject_counts[ip] += 1
+        if _reject_counts[ip] >= 3:
+            with _sec_lock:
+                if ip not in security["blacklist"]:
+                    security["blacklist"].append(ip)
+                    _save_security()
+            print(f"  ⛔ {ip} blacklisted after 3 rejections", flush=True)
+        else:
+            print(f"  ✗ Rejected {ip} — {3 - _reject_counts[ip]} attempt(s) remaining", flush=True)
+
+def _stdin_reader():
+    print("  ⌨  Terminal ready — type  help  to see all commands", flush=True)
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+        except (EOFError, OSError):
+            break
+        cmd = line.lower()
+        if cmd == 'y':
+            with _pending_ips_lock:
+                if not _pending_ips:
+                    print("  ❓ No pending requests", flush=True); continue
+                ip = _pending_ips[-1]
+            _approve_ip(ip, 'allow')
+        elif cmd == 'n':
+            with _pending_ips_lock:
+                if not _pending_ips:
+                    print("  ❓ No pending requests", flush=True); continue
+                ip = _pending_ips[-1]
+            _approve_ip(ip, 'deny')
+        elif cmd.startswith('unblock '):
+            ip = line[8:].strip()
+            if not ip:
+                print("  ❓ Usage: unblock <ip>", flush=True); continue
+            with _sec_lock:
+                changed = False
+                if ip in security.get('blacklist', []):
+                    security['blacklist'].remove(ip)
+                    changed = True
+                if ip in _reject_counts:
+                    _reject_counts[ip] = 0
+                if changed:
+                    _save_security()
+                    print(f"  ✅ {ip} removed from blacklist", flush=True)
+                else:
+                    print(f"  ❓ {ip} not in blacklist", flush=True)
+        elif cmd == 'kick all':
+            _log_event('kick_all', ip='system')
+            if _loop and not _loop.is_closed() and _loop.is_running():
+                asyncio.run_coroutine_threadsafe(_kick_all_clients(), _loop)
+            print("  ✅ All clients kicked", flush=True)
+        elif cmd == 'lockdown off':
+            global _lockdown
+            with _lockdown_lock:
+                _lockdown = False
+            _log_event('lockdown_off', ip='system')
+            print("  ✅ Lockdown lifted", flush=True)
+        elif cmd.startswith('restore security'):
+            parts = cmd.split()
+            n = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
+            ok, info = _restore_security_backup(n)
+            if ok:
+                print(f"  ✅ Security restored from .bak{n}: {info}", flush=True)
+            else:
+                print(f"  ❌ Restore failed: {info}", flush=True)
+        elif cmd == 'help':
+            print(
+                "\n  ┌──────────────────────────────────────────────────────────┐\n"
+                "  │  PortDesk Terminal Commands                              │\n"
+                "  ├──────────────────────────────────────────────────────────┤\n"
+                "  │  y                       Approve last pending IP         │\n"
+                "  │  n                       Reject last pending IP          │\n"
+                "  │  unblock <ip>            Remove IP from blacklist        │\n"
+                "  │  kick all                Disconnect all active clients   │\n"
+                "  │  lockdown off            Lift active lockdown            │\n"
+                "  │  restore security [1-3]  Restore security backup file    │\n"
+                "  │  help                    Show this message               │\n"
+                "  └──────────────────────────────────────────────────────────┘\n",
+                flush=True
+            )
+        else:
+            print("  ❓ Unknown command — type  help  to see all commands", flush=True)
+
+_security_file_mtime = 0
+
+def _security_file_watcher():
+    global _security_file_mtime, security
+    _cleanup_counter = 0
+    while True:
+        time.sleep(2)
+        _cleanup_counter += 1
+        try:
+            mtime = os.path.getmtime(SECURITY_FILE)
+            if mtime != _security_file_mtime:
+                _security_file_mtime = mtime
+                new_sec = _load_security()
+                with _sec_lock:
+                    security.clear()
+                    security.update(new_sec)
+                now = time.time()
+                for ip, ld in new_sec.get("lockout", {}).items():
+                    if isinstance(ld, dict) and ld.get("until", 0) > now:
+                        _pin_lockout[ip]       = ld["until"]
+                        _pin_lockout_count[ip] = ld.get("count", 1)
+                    else:
+                        _pin_lockout.pop(ip, None)
+                _vprint("🔄 Security file reloaded", flush=True)
+        except Exception:
+            pass
+        if _cleanup_counter >= 30:
+            _cleanup_counter = 0
+            cutoff = time.time() - 10
+            with _sec_lock:
+                stale = [ip for ip, ts in list(_req_counts.items()) if not ts or ts[-1] < cutoff]
+                for ip in stale:
+                    del _req_counts[ip]
 
 def _prompt_add_ip(ip):
-    if ip in _pending_ips: return
-    _pending_ips.add(ip)
+    if _record_unknown_attempt(ip):
+        _trigger_lockdown(f'Multi-IP attack detected ({ATTACK_THRESHOLD}+ unknown IPs in {ATTACK_WINDOW}s)')
+        return
+    with _pending_ips_lock:
+        if ip in _pending_ips: return
+        _pending_ips.append(ip)
     count = _reject_counts[ip] + 1
     print(f"\n{'═'*50}\n  🔔 New connection request from: {ip}  (attempt {count}/3)", flush=True)
-    print(f"  To approve : POST /security/approve?ip={ip}&action=allow", flush=True)
-    print(f"  To reject  : POST /security/approve?ip={ip}&action=deny", flush=True)
+    print(f"  Type  y  to approve,  n  to reject", flush=True)
     print('═'*50, flush=True)
     manager.broadcast_sync({'type': 'ip_request', 'ip': ip, 'attempt': count})
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     OPEN_PATHS = {'/security/whitelist/request', '/security/whitelist/remove_self'}
+    SAFE_METHODS = {'GET', 'HEAD', 'OPTIONS'}
+    CSRF_PATHS = {
+        '/explorer/delete', '/explorer/upload', '/explorer/rename',
+        '/explorer/mkdir',  '/explorer/mkfile', '/explorer/copy',
+        '/explorer/move',   '/explorer/shortcut',
+        '/tasks/kill',      '/macros/run',       '/macros/delete',
+        '/log/clear',       '/auth/set_pin',     '/auth/clear_pin',
+        '/scheduled/delete','/scheduled/save',
+    }
 
     async def dispatch(self, request: Request, call_next):
         ip = request.client.host
+
+        with _lockdown_lock:
+            if _lockdown and ip not in ('127.0.0.1', '::1', 'localhost'):
+                return JSONResponse({"error": "server in lockdown"}, status_code=503)
 
         if _is_rate_limited(ip):
             return JSONResponse({"error": "rate limited"}, status_code=429)
 
         if ip in ('127.0.0.1', '::1', 'localhost'):
-            return await call_next(request)
+            response = await call_next(request)
+            response.headers['server'] = 'portdesk'
+            return response
 
         if ip in security.get("blacklist", []):
             return JSONResponse({"error": "blacklisted"}, status_code=403)
 
         if request.url.path in self.OPEN_PATHS:
-            return await call_next(request)
+            response = await call_next(request)
+            response.headers['server'] = 'portdesk'
+            return response
 
         if not _is_allowed(ip):
             _prompt_add_ip(ip)
             return JSONResponse({"error": "not whitelisted"}, status_code=403)
 
-        return await call_next(request)
+        with _active_client_lock:
+            _aip = _active_client_ip
+        if _aip is not None and _aip != ip:
+            return JSONResponse({"error": "session occupied"}, status_code=423)
+
+        # ── Group 6: CSRF Origin check ────────────────────────────────────
+        if request.method not in self.SAFE_METHODS and request.url.path in self.CSRF_PATHS:
+            origin = request.headers.get('origin', '')
+            host   = request.headers.get('host', '')
+            allowed_origins = (
+                f'http://{host}', f'https://{host}',
+                'http://localhost:5000', 'https://localhost:5000',
+                'null', ''
+            )
+            if origin and origin not in allowed_origins:
+                return JSONResponse({"error": "invalid origin"}, status_code=403)
+
+        response = await call_next(request)
+        response.headers['server'] = 'portdesk'
+        return response
 
 from contextlib import asynccontextmanager
 
@@ -180,6 +579,8 @@ async def _lifespan(app):
     threading.Thread(target=_clipboard_watcher, daemon=True).start()
     threading.Thread(target=_scheduler_worker, daemon=True).start()
     threading.Thread(target=_stats_pusher, daemon=True).start()
+    threading.Thread(target=_stdin_reader, daemon=True).start()
+    threading.Thread(target=_security_file_watcher, daemon=True).start()
     for warn in _check_linux_compatibility():
         print(f"⚠️ Linux: {warn}")
     if platform.system() != 'Windows':
@@ -188,6 +589,14 @@ async def _lifespan(app):
         else:
             print("⚠️ Virtual keyboard not available; using fallbacks.")
     threading.Thread(target=_detect_ffmpeg_encoder, daemon=True).start()
+    _flag_detail = (
+        f"watch_only={FLAG_WATCH_ONLY} no_explorer={FLAG_NO_EXPLORER} "
+        f"no_mouse={FLAG_NO_MOUSE} no_keyboard={FLAG_NO_KEYBOARD} "
+        f"no_webrtc={FLAG_NO_WEBRTC} grey={FLAG_GREY} "
+        f"scale={FLAG_SCALE} backend={FLAG_BACKEND or 'auto'} "
+        f"upload_limit={FLAG_UPLOAD_LIMIT or 'unlimited'}"
+    )
+    _log_event('startup', detail=_flag_detail)
     yield
     global _dxcam_camera
     with _dxcam_camera_lock:
@@ -304,7 +713,7 @@ def type_text(text):
             time.sleep(0.05)
         except Exception:
             try: pyautogui.write(text, interval=0.02)
-            except Exception as e: print(f"❌ type_text: {e}")
+            except Exception as e: _vprint(f"❌ type_text: {e}", flush=True)
 
 _virtual_kb_device = None
 
@@ -332,7 +741,7 @@ def _init_virtual_keyboard():
         _virtual_kb_device = uinput.Device(events)
         return True
     except Exception as e:
-        print(f"Virtual keyboard init failed: {e}")
+        _vprint(f"Virtual keyboard init failed: {e}", flush=True)
         return False
 
 def _send_virtual_key(key_code, press=True):
@@ -340,7 +749,7 @@ def _send_virtual_key(key_code, press=True):
         try:
             _virtual_kb_device.emit(key_code, 1 if press else 0)
         except Exception as e:
-            print(f"Virtual key send failed: {e}")
+            _vprint(f"Virtual key send failed: {e}", flush=True)
 
 def _send_virtual_text(text):
     for char in text:
@@ -359,12 +768,12 @@ def _send_virtual_text(text):
 def _send_xdotool_key(key):
     if SUBPROCESS_AVAILABLE and platform.system() == 'Linux':
         try: subprocess.run(['xdotool', 'key', key], check=True)
-        except Exception as e: print(f"xdotool key failed: {e}")
+        except Exception as e: print(f"xdotool key failed: {e}", flush=True)
 
 def _send_xdotool_text(text):
     if SUBPROCESS_AVAILABLE and platform.system() == 'Linux':
         try: subprocess.run(['xdotool', 'type', '--clearmodifiers', text], check=True)
-        except Exception as e: print(f"xdotool text failed: {e}")
+        except Exception as e: print(f"xdotool text failed: {e}", flush=True)
 
 screen_streaming   = False
 screen_thread      = None
@@ -380,9 +789,9 @@ def _get_dxcam_camera(mon_idx=0):
             try:
                 _dxcam_camera = _dxcam.create(output_idx=mon_idx, output_color="BGR")
                 _dxcam_camera.start(target_fps=60, video_mode=True)
-                print("✅ dxcam camera created")
+                _vprint("✅ dxcam camera created", flush=True)
             except Exception as e:
-                print(f"❌ dxcam create: {e}")
+                _vprint(f"❌ dxcam create: {e}", flush=True)
         return _dxcam_camera
 
 stream_config = {
@@ -398,7 +807,7 @@ def _detect_ffmpeg_encoder():
     global _ffmpeg_encoder, _ffmpeg_encoder_ok
     import shutil
     if not shutil.which('ffmpeg'):
-        print("⚠ FFmpeg not found in PATH — hardware encoding unavailable")
+        _vprint("⚠ FFmpeg not found in PATH — hardware encoding unavailable", flush=True)
         return None
     if not CV2_AVAILABLE:
         return None
@@ -436,7 +845,7 @@ def _detect_ffmpeg_encoder():
 
     for enc, enc_flags in candidates:
         if enc != 'libx264' and enc not in enc_list:
-            print(f"  ↳ {enc}: not listed in ffmpeg encoders, skip")
+            _vprint(f"  ↳ {enc}: not listed in ffmpeg encoders, skip", flush=True)
             continue
         try:
             if enc == 'h264_vaapi':
@@ -464,20 +873,20 @@ def _detect_ffmpeg_encoder():
                 _ffmpeg_encoder    = enc
                 _ffmpeg_encoder_ok = True
                 hw = enc != 'libx264'
-                print(f"✅ FFmpeg encoder: {enc} ({'hardware' if hw else 'software fallback'})")
+                _vprint(f"✅ FFmpeg encoder: {enc} ({'hardware' if hw else 'software fallback'})", flush=True)
                 return enc
             else:
-                print(f"  ↳ {enc}: returned error")
+                _vprint(f"  ↳ {enc}: returned error", flush=True)
         except FileNotFoundError:
-            print("⚠ FFmpeg not found"); return None
+            _vprint("⚠ FFmpeg not found", flush=True); return None
         except subprocess.TimeoutExpired:
             try: proc.kill()
             except: pass
-            print(f"  ↳ {enc}: timeout")
+            _vprint(f"  ↳ {enc}: timeout", flush=True)
         except Exception as e:
-            print(f"  ↳ {enc}: {e}"); continue
+            _vprint(f"  ↳ {enc}: {e}", flush=True); continue
 
-    print("⚠ FFmpeg: no encoder detected")
+    _vprint("⚠ FFmpeg: no encoder detected", flush=True)
     return None
 
 
@@ -549,7 +958,7 @@ class _FfmpegH264Streamer:
             self._reader.start()
             return True
         except Exception as e:
-            print(f"❌ H264Streamer start: {e}")
+            _vprint(f"❌ H264Streamer start: {e}", flush=True)
             self._running = False
             return False
 
@@ -567,7 +976,7 @@ class _FfmpegH264Streamer:
                     )
             except Exception as e:
                 if self._running:
-                    print(f"❌ H264Streamer read: {e}")
+                    _vprint(f"❌ H264Streamer read: {e}", flush=True)
                 break
 
     def send_frame(self, frame_bgr):
@@ -637,9 +1046,9 @@ def screen_worker():
         h264 = _FfmpegH264Streamer(_ffmpeg_encoder, target_w, target_h, fps)
         if not h264.start():
             use_h264 = False
-            print("⚠ H264 streamer failed to start — falling back to JPEG")
+            _vprint("⚠ H264 streamer failed to start — falling back to JPEG", flush=True)
         else:
-            print(f"✅ screen: H264 via {_ffmpeg_encoder} ({target_w}x{target_h} @ {fps}fps)")
+            _vprint(f"✅ screen: H264 via {_ffmpeg_encoder} ({target_w}x{target_h} @ {fps}fps)", flush=True)
             asyncio.run_coroutine_threadsafe(
                 manager.broadcast({'type': 'stream_mode', 'mode': 'h264',
                                    'encoder': _ffmpeg_encoder,
@@ -652,9 +1061,9 @@ def screen_worker():
             from turbojpeg import TurboJPEG, TJPF_BGR, TJSAMP_444 as _TJSAMP_444
             tj, use_turbo = TurboJPEG(), True
             _TJPF_BGR = TJPF_BGR
-            print("✅ screen: TurboJPEG active")
+            _vprint("✅ screen: TurboJPEG active", flush=True)
         except Exception as _te:
-            print(f"⚠ screen: TurboJPEG not available ({_te}), falling back to cv2")
+            _vprint(f"⚠ screen: TurboJPEG not available ({_te}), falling back to cv2", flush=True)
         asyncio.run_coroutine_threadsafe(
             manager.broadcast({'type': 'stream_mode', 'mode': 'jpeg'}), _loop
         )
@@ -721,7 +1130,7 @@ def screen_worker():
             if use_h264:
                 ok = await loop.run_in_executor(None, h264.send_frame, arr)
                 if not ok:
-                    print("⚠ H264 send_frame failed"); break
+                    _vprint("⚠ H264 send_frame failed", flush=True); break
                 fps_frames += 1
                 now = time.perf_counter()
                 if now - fps_t >= 1.0:
@@ -764,7 +1173,6 @@ def screen_worker():
 
     emit_future = asyncio.run_coroutine_threadsafe(_encode_emit(), _loop)
 
-    # ── helper: put frame into asyncio queue from capture thread ─────────────
     def _put_frame(arr, cfg):
         if not _pipe.empty():
             try: _pipe.get_nowait()
@@ -773,6 +1181,8 @@ def screen_worker():
         except: pass
 
     use_dxcam = DXCAM_AVAILABLE and platform.system() == 'Windows' and CV2_AVAILABLE
+    if FLAG_BACKEND == 'mss': use_dxcam = False
+    elif FLAG_BACKEND == 'dxcam' and not (DXCAM_AVAILABLE and platform.system() == 'Windows'): use_dxcam = False
 
     if use_dxcam:
         try:
@@ -784,44 +1194,58 @@ def screen_worker():
             else:
                 with _mss.mss() as _sct:
                     _monitors = _sct.monitors[:]
-                print("✅ screen: dxcam active")
-                while screen_streaming:
-                    try:
-                        t0 = time.perf_counter()
-                        with _stream_config_lock: cfg = stream_config.copy()
-                        fps          = max(1, cfg['fps'])
-                        frame_budget = 1.0 / fps
-                        target_h     = cfg['height']
+                _vprint("✅ screen: dxcam active", flush=True)
+                try:
+                    while screen_streaming:
+                        try:
+                            t0 = time.perf_counter()
+                            with _stream_config_lock: cfg = stream_config.copy()
+                            fps          = max(1, cfg['fps'])
+                            frame_budget = 1.0 / fps
+                            target_h     = cfg['height']
 
-                        frame = camera.grab()
-                        if frame is None:
+                            frame = camera.grab()
+                            if frame is None:
+                                elapsed = time.perf_counter() - t0
+                                sleep_t = frame_budget - elapsed
+                                if sleep_t > 0.001: time.sleep(sleep_t)
+                                continue
+
+                            src_h, src_w = frame.shape[:2]
+                            mon_idx_mss  = min(cfg.get('monitor', 1), len(_monitors) - 1)
+                            mon          = _monitors[max(1, mon_idx_mss)]
+                            nw = int(src_w * target_h / src_h)
+                            if src_h != target_h:
+                                interp = cv2.INTER_AREA if target_h < src_h else cv2.INTER_LINEAR
+                                arr = cv2.resize(frame, (nw, target_h), interpolation=interp)
+                            else:
+                                arr = np.ascontiguousarray(frame)
+                            if FLAG_SCALE != 1.0:
+                                sh, sw = arr.shape[:2]
+                                arr = cv2.resize(arr, (int(sw*FLAG_SCALE), int(sh*FLAG_SCALE)), interpolation=cv2.INTER_AREA)
+                            if FLAG_GREY:
+                                g = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+                                arr = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+                            with _mouse_pos_lock: mx, my = _mouse_pos
+                            _draw_cursor(arr, mx, my, mon['left'], mon['top'], src_w, src_h,
+                                         cfg.get('cursor_color_bgr', (255, 255, 255)))
+
+                            _loop.call_soon_threadsafe(_put_frame, arr, cfg)
+
                             elapsed = time.perf_counter() - t0
                             sleep_t = frame_budget - elapsed
                             if sleep_t > 0.001: time.sleep(sleep_t)
-                            continue
-
-                        src_h, src_w = frame.shape[:2]
-                        mon_idx_mss  = min(cfg.get('monitor', 1), len(_monitors) - 1)
-                        mon          = _monitors[max(1, mon_idx_mss)]
-                        nw = int(src_w * target_h / src_h)
-                        if src_h != target_h:
-                            interp = cv2.INTER_AREA if target_h < src_h else cv2.INTER_LINEAR
-                            arr = cv2.resize(frame, (nw, target_h), interpolation=interp)
-                        else:
-                            arr = np.ascontiguousarray(frame)
-                        with _mouse_pos_lock: mx, my = _mouse_pos
-                        _draw_cursor(arr, mx, my, mon['left'], mon['top'], src_w, src_h,
-                                     cfg.get('cursor_color_bgr', (255, 255, 255)))
-
-                        _loop.call_soon_threadsafe(_put_frame, arr, cfg)
-
-                        elapsed = time.perf_counter() - t0
-                        sleep_t = frame_budget - elapsed
-                        if sleep_t > 0.001: time.sleep(sleep_t)
-                    except Exception as e:
-                        _screen_last_error = str(e); print(f"❌ dxcam frame: {e}"); time.sleep(0.1)
+                        except Exception as e:
+                            _screen_last_error = str(e); _vprint(f"❌ dxcam frame: {e}", flush=True); time.sleep(0.1)
+                finally:
+                    with _dxcam_camera_lock:
+                        global _dxcam_camera
+                        if _dxcam_camera is not None:
+                            try: _dxcam_camera.stop()
+                            except: pass
+                            _dxcam_camera = None
         except Exception as e:
-            _screen_last_error = str(e); print(f"❌ dxcam init: {e}")
+            _screen_last_error = str(e); _vprint(f"❌ dxcam init: {e}", flush=True)
     else:
         if not MSS_AVAILABLE:
             _screen_last_error = 'mss not available'; return
@@ -846,6 +1270,12 @@ def screen_worker():
                             arr = cv2.resize(arr, (nw, target_h), interpolation=interp)
                         else:
                             arr = np.ascontiguousarray(arr)
+                        if FLAG_SCALE != 1.0:
+                            sh, sw = arr.shape[:2]
+                            arr = cv2.resize(arr, (int(sw*FLAG_SCALE), int(sh*FLAG_SCALE)), interpolation=cv2.INTER_AREA)
+                        if FLAG_GREY:
+                            g = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+                            arr = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
                         with _mouse_pos_lock: mx, my = _mouse_pos
                         _draw_cursor(arr, mx, my, mon['left'], mon['top'], w, h,
                                      cfg.get('cursor_color_bgr', (255, 255, 255)))
@@ -856,9 +1286,9 @@ def screen_worker():
                         sleep_t = frame_budget - elapsed
                         if sleep_t > 0.001: time.sleep(sleep_t)
                     except Exception as e:
-                        _screen_last_error = str(e); print(f"❌ frame: {e}"); time.sleep(0.1)
+                        _screen_last_error = str(e); _vprint(f"❌ frame: {e}", flush=True); time.sleep(0.1)
         except Exception as e:
-            _screen_last_error = str(e); print(f"❌ screen_worker: {e}")
+            _screen_last_error = str(e); _vprint(f"❌ screen_worker: {e}", flush=True)
 
     try: _loop.call_soon_threadsafe(_pipe.put_nowait, None)
     except: pass
@@ -882,6 +1312,9 @@ if WEBRTC_AVAILABLE:
             self._time_base  = _Fraction(1, 90000)
             self._fps        = 30
             self._last_arr   = None
+            self._sct        = _mss.mss() if MSS_AVAILABLE else None
+            self._sct_mon_idx = -1
+            self._sct_mon    = None
 
         async def recv(self):
             loop = asyncio.get_event_loop()
@@ -909,26 +1342,30 @@ if WEBRTC_AVAILABLE:
             if not CV2_AVAILABLE: return None
             try:
                 with _stream_config_lock: cfg = stream_config.copy()
-                target_h = cfg['height']
+                target_h  = cfg['height']
+                mon_idx   = min(cfg.get('monitor', 1), len(self._sct.monitors) - 1) if self._sct else 1
                 dx = _get_dxcam_camera()
                 if dx is not None:
                     frame = dx.grab()
                     if frame is None: return None
                     src_h, src_w = frame.shape[:2]
                     arr = frame
-                    with _mss.mss() as sct:
-                        mon_idx = min(cfg.get('monitor', 1), len(sct.monitors) - 1)
-                        mon     = sct.monitors[max(1, mon_idx)]
-                    mon_left, mon_top = mon['left'], mon['top']
+                    if self._sct:
+                        if mon_idx != self._sct_mon_idx:
+                            self._sct_mon_idx = mon_idx
+                            self._sct_mon = self._sct.monitors[max(1, mon_idx)]
+                        mon_left, mon_top = self._sct_mon['left'], self._sct_mon['top']
+                    else:
+                        mon_left, mon_top = 0, 0
                 else:
-                    if not MSS_AVAILABLE: return None
-                    with _mss.mss() as sct:
-                        mon_idx  = min(cfg.get('monitor', 1), len(sct.monitors) - 1)
-                        mon      = sct.monitors[max(1, mon_idx)]
-                        img      = sct.grab(mon)
-                    arr      = np.frombuffer(img.raw, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
+                    if not MSS_AVAILABLE or not self._sct: return None
+                    if mon_idx != self._sct_mon_idx:
+                        self._sct_mon_idx = mon_idx
+                        self._sct_mon = self._sct.monitors[max(1, mon_idx)]
+                    img  = self._sct.grab(self._sct_mon)
+                    arr  = np.frombuffer(img.raw, dtype=np.uint8).reshape((img.height, img.width, 4))[:, :, :3]
                     src_h, src_w = arr.shape[:2]
-                    mon_left, mon_top = mon['left'], mon['top']
+                    mon_left, mon_top = self._sct_mon['left'], self._sct_mon['top']
 
                 nw = int(src_w * target_h / src_h)
                 if src_h != target_h:
@@ -941,8 +1378,6 @@ if WEBRTC_AVAILABLE:
                              cfg.get('cursor_color_bgr', (255, 255, 255)))
                 return arr
             except: return None
-
-_webrtc_pcs: set = set()
 
 _mic_queue  = _queue.Queue(maxsize=40)
 _mic_active = False
@@ -958,7 +1393,7 @@ def _mic_worker():
             if 'cable' in name and dev['max_output_channels'] > 0:
                 device_idx = i; break
         if device_idx is None:
-            print("❌ mic: CABLE Input not found — start VB-Audio")
+            _vprint("❌ mic: CABLE Input not found — start VB-Audio", flush=True)
             _mic_active = False; return
         stream = sd.RawOutputStream(samplerate=44100, channels=1, dtype='int16',
                                     blocksize=2048, latency='low', device=device_idx)
@@ -969,9 +1404,9 @@ def _mic_worker():
                 if pcm is None: break
                 stream.write(pcm)
             except _queue.Empty: continue
-            except Exception as e: print(f"mic_worker write: {e}")
+            except Exception as e: _vprint(f"mic_worker write: {e}", flush=True)
         stream.stop(); stream.close()
-    except Exception as e: print(f"mic_worker: {e}")
+    except Exception as e: _vprint(f"mic_worker: {e}", flush=True)
 
 audio_streaming = False
 _audio_thread   = None
@@ -988,7 +1423,7 @@ def _audio_worker():
             if 'cable' in name and dev['max_input_channels'] > 0:
                 device_idx = i; break
         if device_idx is None:
-            print("❌ audio: CABLE Output not found — start VB-Audio")
+            _vprint("❌ audio: CABLE Output not found — start VB-Audio", flush=True)
             audio_streaming = False; return
         with sd.InputStream(samplerate=_AUDIO_RATE, channels=1, dtype='int16',
                             blocksize=_AUDIO_CHUNK, device=device_idx) as stream:
@@ -997,7 +1432,7 @@ def _audio_worker():
                 encoded = base64.b64encode(data.tobytes()).decode()
                 manager.broadcast_sync({'type': 'audio_chunk', 'data': encoded})
     except Exception as e:
-        print(f"❌ audio_worker: {e}"); audio_streaming = False
+        _vprint(f"❌ audio_worker: {e}", flush=True); audio_streaming = False
 
 _last_clip    = ""
 _clip_lock    = threading.Lock()
@@ -1008,14 +1443,14 @@ def _clipboard_watcher():
     try:
         import pyperclip
     except ImportError:
-        print("⚠ pyperclip not available — clipboard sync disabled"); return
+        _vprint("⚠ pyperclip not available — clipboard sync disabled", flush=True); return
     while _clip_running:
         try:
             current = pyperclip.paste()
             with _clip_lock:
                 if current and current != _last_clip:
                     _last_clip = current
-                    manager.broadcast_sync({'type': 'clipboard_update', 'text': current})
+                    manager.broadcast_ws_only_sync({'type': 'clipboard_update', 'text': current})
         except: pass
         time.sleep(2)
 
@@ -1030,11 +1465,58 @@ def _stats_pusher():
 LOG_FILE  = os.path.join(BASE_DIR, "portdesk_events.log")
 _log_lock = threading.Lock()
 
-def _log_event(event_type, detail='', ip='system'):
-    line = json.dumps({'t': time.strftime('%Y-%m-%d %H:%M:%S'), 'type': event_type, 'ip': ip, 'detail': detail})
+_SEVERITY_MAP = {
+    'connect':       'INFO',
+    'disconnect':    'INFO',
+    'pin_success':   'INFO',
+    'pin_fail':      'WARNING',
+    'pin_set':       'INFO',
+    'pin_cleared':   'INFO',
+    'task_kill':     'WARNING',
+    'mic_start':     'INFO',
+    'mic_stop':      'INFO',
+    'audio_start':   'INFO',
+    'audio_stop':    'INFO',
+    'sched_run':     'INFO',
+    'ip_rejected':   'WARNING',
+    'ip_blacklisted':'WARNING',
+    'lockdown':      'CRITICAL',
+    'lockdown_off':  'INFO',
+    'intrusion':     'CRITICAL',
+    'kick_all':      'WARNING',
+    'startup':        'INFO',
+    'security_restore':'WARNING',
+}
+
+def _log_event(event_type, detail='', ip='system', severity=None):
     with _log_lock:
+        last_hash = '0' * 64
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, 'rb') as f:
+                    lines = f.read().splitlines()
+                for line in reversed(lines):
+                    if line.strip():
+                        try:
+                            last_hash = json.loads(line).get('hash', '0' * 64)
+                        except: pass
+                        break
+        except: pass
+
+        sev = severity or _SEVERITY_MAP.get(event_type, 'INFO')
+        entry = {
+            't':        time.strftime('%Y-%m-%d %H:%M:%S'),
+            'type':     event_type,
+            'severity': sev,
+            'ip':       ip,
+            'detail':   detail,
+            'prev':     last_hash,
+        }
+        chain_str     = json.dumps(entry, sort_keys=True, separators=(',', ':'))
+        entry['hash'] = hashlib.sha256(chain_str.encode()).hexdigest()
+
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
+            f.write(json.dumps(entry) + '\n')
 
 def _press_win_shortcut(keys):
     system = platform.system()
@@ -1065,7 +1547,7 @@ def _press_win_shortcut(keys):
             with _pyautogui_lock: pyautogui.hotkey(*keys)
             return True
     except Exception as e:
-        print(f"win shortcut error: {e}"); return False
+        _vprint(f"win shortcut error: {e}", flush=True); return False
 
 SCHED_FILE    = os.path.join(BASE_DIR, "portdesk_scheduled.json")
 _sched_lock   = threading.Lock()
@@ -1112,28 +1594,26 @@ def _scheduler_worker():
                             for step in s:
                                 t = step.get('type','')
                                 try:
-                                    with _pyautogui_lock:
-                                        if   t=='key':      pyautogui.press(map_key(step['key']))
-                                        elif t=='shortcut': pyautogui.hotkey(*[map_key(k) for k in step['keys']])
-                                        elif t=='type':     type_text(step['text'])
-                                        elif t=='click':
-                                            bt = step.get('btn','left')
-                                            if   bt=='left':   pyautogui.click()
-                                            elif bt=='right':  pyautogui.rightClick()
-                                            elif bt=='double': pyautogui.doubleClick()
-                                        elif t=='scroll':   pyautogui.scroll(int(step.get('dy',0)))
+                                    if t == 'type':
+                                        type_text(step['text'])
+                                    else:
+                                        with _pyautogui_lock:
+                                            if   t=='key':      pyautogui.press(map_key(step['key']))
+                                            elif t=='shortcut': pyautogui.hotkey(*[map_key(k) for k in step['keys']])
+                                            elif t=='click':
+                                                bt = step.get('btn','left')
+                                                if   bt=='left':   pyautogui.click()
+                                                elif bt=='right':  pyautogui.rightClick()
+                                                elif bt=='double': pyautogui.doubleClick()
+                                            elif t=='scroll':   pyautogui.scroll(int(step.get('dy',0)))
                                     delay = step.get('delay', 0.1)
                                     if delay > 0: time.sleep(delay)
-                                except Exception as e: print(f"sched step: {e}")
+                                except Exception as e: _vprint(f"sched step: {e}", flush=True)
                         threading.Thread(target=_run, daemon=True).start()
                         _log_event('sched_run', macro_name)
         time.sleep(10)
 
-_pin_fails        = defaultdict(int)
-_pin_lockout      = {}
-_pin_lockout_count = defaultdict(int)
-PIN_MAX_TRIES      = 5
-PIN_LOCKOUT_STEPS  = [60, 180, 300]
+_pin_lockout_existing_ = True  # lockout vars already declared above
 
 def _check_linux_compatibility():
     if platform.system() != 'Linux': return []
@@ -1150,33 +1630,64 @@ def _check_linux_compatibility():
         errors.append('xdotool not installed; virtual keyboard may be slower or unavailable on Linux.')
     return errors
 
-async def _dispatch(data: dict, ws: WebSocket):
+async def _dispatch(data: dict, ws):
     global screen_streaming, screen_thread, _mic_active, _mic_worker_thread, audio_streaming, _audio_thread
     t  = data.get('_ev', data.get('type', ''))
     ip = ws.client.host
 
+    # ── Group 3: per-event-type rate limiting ─────────────────────────────
+    bucket = _ws_buckets.get(t, _ws_buckets['default'])
+    if not bucket.consume(ip):
+        return
+
+    _mouse_events = {'move','click','scroll','selector_start','selector_move','selector_end'}
+    _keyboard_events = {'key','type','key_down','key_up','shortcut'}
+    if t in _mouse_events and (FLAG_NO_MOUSE or FLAG_WATCH_ONLY): return
+    if t in _keyboard_events and (FLAG_NO_KEYBOARD or FLAG_WATCH_ONLY): return
+
     if t == 'move':
-        with _pyautogui_lock:
-            pyautogui.moveRel(int(data.get('dx',0)), int(data.get('dy',0)), duration=0)
+        dx, dy = int(data.get('dx',0)), int(data.get('dy',0))
+        def _do_move():
+            if _pyautogui_lock.acquire(blocking=False):
+                try: pyautogui.moveRel(dx, dy, duration=0)
+                finally: _pyautogui_lock.release()
+        asyncio.get_event_loop().run_in_executor(None, _do_move)
 
     elif t == 'click':
         ct = data.get('type', 'left')
-        with _pyautogui_lock:
-            if   ct=='left':   pyautogui.click()
-            elif ct=='right':  pyautogui.rightClick()
-            elif ct=='double': pyautogui.doubleClick()
-            elif ct=='middle': pyautogui.middleClick()
+        loop = asyncio.get_event_loop()
+        def _do_click():
+            with _pyautogui_lock:
+                if   ct=='left':   pyautogui.click()
+                elif ct=='right':  pyautogui.rightClick()
+                elif ct=='double': pyautogui.doubleClick()
+                elif ct=='middle': pyautogui.middleClick()
+        await loop.run_in_executor(None, _do_click)
 
     elif t == 'scroll':
-        with _pyautogui_lock:
-            pyautogui.scroll(int(data.get('dy',0)))
+        dy = int(data.get('dy',0))
+        loop = asyncio.get_event_loop()
+        def _do_scroll():
+            with _pyautogui_lock: pyautogui.scroll(dy)
+        await loop.run_in_executor(None, _do_scroll)
 
     elif t == 'selector_start':
-        with _pyautogui_lock: pyautogui.mouseDown()
+        loop = asyncio.get_event_loop()
+        def _do_sel_start():
+            with _pyautogui_lock: pyautogui.mouseDown()
+        await loop.run_in_executor(None, _do_sel_start)
     elif t == 'selector_move':
-        with _pyautogui_lock: pyautogui.moveRel(int(data.get('dx',0)), int(data.get('dy',0)), duration=0)
+        dx, dy = int(data.get('dx',0)), int(data.get('dy',0))
+        def _do_sel_move():
+            if _pyautogui_lock.acquire(blocking=False):
+                try: pyautogui.moveRel(dx, dy, duration=0)
+                finally: _pyautogui_lock.release()
+        asyncio.get_event_loop().run_in_executor(None, _do_sel_move)
     elif t == 'selector_end':
-        with _pyautogui_lock: pyautogui.mouseUp()
+        loop = asyncio.get_event_loop()
+        def _do_sel_end():
+            with _pyautogui_lock: pyautogui.mouseUp()
+        await loop.run_in_executor(None, _do_sel_end)
 
     elif t == 'shortcut':
         keys   = [map_key(k) for k in data.get('keys',[])]
@@ -1196,7 +1707,7 @@ async def _dispatch(data: dict, ws: WebSocket):
                 with _pyautogui_lock: pyautogui.hotkey(*mac_keys)
             else:
                 with _pyautogui_lock: pyautogui.hotkey(*keys)
-        except Exception as e: print(f"shortcut error: {e}")
+        except Exception as e: _vprint(f"shortcut error: {e}", flush=True)
 
     elif t == 'key':
         key    = map_key(data.get('key', ''))
@@ -1213,11 +1724,11 @@ async def _dispatch(data: dict, ws: WebSocket):
             else:
                 try:
                     with _pyautogui_lock: pyautogui.press(key)
-                except Exception as e: print(f"key: {e}")
+                except Exception as e: _vprint(f"key: {e}", flush=True)
         else:
             try:
                 with _pyautogui_lock: pyautogui.press(key)
-            except Exception as e: print(f"key: {e}")
+            except Exception as e: _vprint(f"key: {e}", flush=True)
 
     elif t == 'type':
         text   = data.get('text', '')
@@ -1230,14 +1741,22 @@ async def _dispatch(data: dict, ws: WebSocket):
         else: await loop.run_in_executor(None, type_text, text)
 
     elif t == 'key_down':
-        try:
-            with _pyautogui_lock: pyautogui.keyDown(map_key(data.get('key','')))
-        except Exception as e: print(f"key_down: {e}")
+        _key = map_key(data.get('key',''))
+        loop = asyncio.get_event_loop()
+        def _do_kd():
+            try:
+                with _pyautogui_lock: pyautogui.keyDown(_key)
+            except Exception as e: _vprint(f"key_down: {e}", flush=True)
+        await loop.run_in_executor(None, _do_kd)
 
     elif t == 'key_up':
-        try:
-            with _pyautogui_lock: pyautogui.keyUp(map_key(data.get('key','')))
-        except Exception as e: print(f"key_up: {e}")
+        _key = map_key(data.get('key',''))
+        loop = asyncio.get_event_loop()
+        def _do_ku():
+            try:
+                with _pyautogui_lock: pyautogui.keyUp(_key)
+            except Exception as e: _vprint(f"key_up: {e}", flush=True)
+        await loop.run_in_executor(None, _do_ku)
 
     elif t == 'stream_config':
         with _stream_config_lock:
@@ -1291,7 +1810,7 @@ async def _dispatch(data: dict, ws: WebSocket):
             pcm = base64.b64decode(raw)
             try: _mic_queue.put_nowait(pcm)
             except _queue.Full: pass
-        except Exception as e: print(f"mic_chunk: {e}")
+        except Exception as e: _vprint(f"mic_chunk: {e}", flush=True)
 
     elif t == 'audio_start':
         if _audio_thread and _audio_thread.is_alive(): return
@@ -1306,14 +1825,24 @@ async def _dispatch(data: dict, ws: WebSocket):
 
 @app.websocket('/ws')
 async def websocket_endpoint(ws: WebSocket):
-    global screen_streaming, audio_streaming, _mic_active
+    global screen_streaming, audio_streaming, _mic_active, _active_client_ws
     ip = ws.client.host
+
+    with _lockdown_lock:
+        if _lockdown and ip not in ('127.0.0.1', '::1', 'localhost'):
+            await ws.close(1008); return
 
     if ip not in ('127.0.0.1', '::1', 'localhost'):
         if ip in security.get("blacklist", []):
             await ws.close(1008); return
         if not _is_allowed(ip):
             await ws.close(1008); return
+
+    with _active_client_lock:
+        if _active_client_ws is not None:
+            await ws.close(1008); return
+        _active_client_ws = ws
+        globals()['_active_client_ip'] = ip
 
     await manager.connect(ws)
     _log_event('connect', ip=ip)
@@ -1325,8 +1854,12 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        print(f"ws error: {e}")
+        _vprint(f"ws error: {e}", flush=True)
     finally:
+        with _active_client_lock:
+            if _active_client_ws is ws:
+                _active_client_ws = None
+                globals()['_active_client_ip'] = None
         manager.disconnect(ws)
         screen_streaming = False
         audio_streaming  = False
@@ -1340,12 +1873,18 @@ async def websocket_endpoint(ws: WebSocket):
 
 @app.post('/webrtc/offer')
 async def webrtc_offer(request: Request):
-    if not WEBRTC_AVAILABLE:
-        return JSONResponse({'error': 'aiortc not installed'}, status_code=501)
+    if not WEBRTC_AVAILABLE or FLAG_NO_WEBRTC:
+        return JSONResponse({'error': 'WebRTC disabled'}, status_code=501)
+
+    ip = request.client.host
+    with _active_client_lock:
+        _aip = _active_client_ip
+    if _aip is not None and _aip != ip:
+        return JSONResponse({'error': 'session occupied'}, status_code=423)
 
     params = await request.json()
     offer  = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
-    pc     = RTCPeerConnection()
+    pc     = RTCPeerConnection(configuration=RTCConfiguration(iceServers=STUN_SERVERS))
     _webrtc_pcs.add(pc)
 
     @pc.on('connectionstatechange')
@@ -1365,6 +1904,73 @@ async def webrtc_offer(request: Request):
         _webrtc_pcs.discard(pc)
         return JSONResponse({'error': str(e)}, status_code=500)
 
+
+@app.post('/webrtc/control/offer')
+async def webrtc_control_offer(request: Request):
+    """WebRTC data channel endpoint — layer 2 fallback for control commands via STUN P2P."""
+    if not WEBRTC_AVAILABLE or FLAG_NO_WEBRTC:
+        return JSONResponse({'error': 'WebRTC disabled'}, status_code=501)
+
+    ip = request.client.host
+    if ip not in ('127.0.0.1', '::1', 'localhost') and not _is_allowed(ip):
+        return JSONResponse({'error': 'not whitelisted'}, status_code=403)
+
+    params = await request.json()
+    offer  = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
+    pc     = RTCPeerConnection(configuration=RTCConfiguration(iceServers=STUN_SERVERS))
+    _webrtc_pcs.add(pc)
+
+    dc_client_ref: list = []
+
+    @pc.on('datachannel')
+    def on_datachannel(channel):
+        with _active_client_lock:
+            if _active_client_ws is not None:
+                try: channel.close()
+                except: pass
+                return
+        dc = _DataChannelClient(channel, ip)
+        dc_client_ref.append(dc)
+        with _webrtc_dc_lock:
+            _webrtc_dc_clients.append(dc)
+        manager.active.append(dc)
+        print(f"✅ WebRTC data channel opened from {ip}", flush=True)
+
+        @channel.on('message')
+        async def on_message(message):
+            try:
+                data = json.loads(message)
+                await _dispatch(data, dc)
+            except Exception as e:
+                _vprint(f"DC dispatch error: {e}", flush=True)
+
+        @channel.on('close')
+        def on_close():
+            with _webrtc_dc_lock:
+                if dc in _webrtc_dc_clients:
+                    _webrtc_dc_clients.remove(dc)
+            if dc in manager.active:
+                manager.active.remove(dc)
+            print(f"ℹ️  WebRTC data channel closed from {ip}", flush=True)
+
+    @pc.on('connectionstatechange')
+    async def on_state():
+        if pc.connectionState in ('failed', 'closed', 'disconnected'):
+            for dc in dc_client_ref:
+                with _webrtc_dc_lock:
+                    if dc in _webrtc_dc_clients:
+                        _webrtc_dc_clients.remove(dc)
+                if dc in manager.active:
+                    manager.active.remove(dc)
+            await pc.close()
+            _webrtc_pcs.discard(pc)
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    return {'sdp': pc.localDescription.sdp, 'type': pc.localDescription.type}
+
+
 @app.get('/')
 async def index(request: Request):
     path = os.path.join(BASE_DIR, 'portdesk_client.html')
@@ -1378,7 +1984,9 @@ async def ping():
     return {'pong': time.time()}
 
 @app.get('/stats')
-async def stats():
+async def stats(request: Request):
+    if not _is_allowed(request.client.host):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
     return get_system_stats()
 
 @app.get('/screen/status')
@@ -1392,8 +2000,11 @@ async def screen_status():
     }
 
 @app.post('/screen/start')
-async def screen_start_http():
+async def screen_start_http(request: Request):
     global screen_streaming, screen_thread
+    with _active_client_lock:
+        if _active_client_ws is None:
+            return JSONResponse({'error': 'no active client'}, status_code=403)
     if not screen_streaming:
         screen_streaming = True
         screen_thread = threading.Thread(target=screen_worker, daemon=True)
@@ -1427,27 +2038,10 @@ async def security_approve(request: Request, ip: str = '', action: str = 'allow'
         return JSONResponse({"error": "forbidden"}, status_code=403)
     if not ip:
         return JSONResponse({"error": "ip required"}, status_code=400)
-    _pending_ips.discard(ip)
+    _approve_ip(ip, action)
     if action == 'allow':
-        with _sec_lock:
-            if ip not in security["whitelist"]:
-                security["whitelist"].append(ip)
-            _reject_counts[ip] = 0
-            _save_security()
-        print(f"  ✅ Approved {ip}", flush=True)
-        manager.broadcast_sync({'type': 'ip_approved', 'ip': ip})
         return {"ok": True, "approved": ip}
-    else:
-        _reject_counts[ip] += 1
-        if _reject_counts[ip] >= 3:
-            with _sec_lock:
-                if ip not in security["blacklist"]:
-                    security["blacklist"].append(ip)
-                    _save_security()
-            print(f"  ⛔ {ip} blacklisted after 3 rejections", flush=True)
-        else:
-            print(f"  ✗ Rejected {ip} — {3 - _reject_counts[ip]} attempt(s) remaining", flush=True)
-        return {"ok": True, "rejected": ip}
+    return {"ok": True, "rejected": ip}
 
 @app.post('/security/whitelist/remove_self')
 async def whitelist_remove_self(request: Request):
@@ -1455,7 +2049,12 @@ async def whitelist_remove_self(request: Request):
     with _sec_lock:
         if ip in security.get("whitelist", []):
             security["whitelist"].remove(ip)
-            _save_security()
+        security.get("pins", {}).pop(ip, None)
+        security.get("lockout", {}).pop(ip, None)
+        _save_security()
+    _pin_lockout.pop(ip, None)
+    _pin_fails[ip] = 0
+    _pin_lockout_count[ip] = 0
     return {"ok": True}
 
 @app.post('/security/blacklist/remove')
@@ -1482,61 +2081,76 @@ def _list_drives():
 
 @app.get('/explorer/drives')
 async def explorer_drives():
+    if FLAG_NO_EXPLORER or FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     return _list_drives()
 
 @app.get('/explorer/list')
 async def explorer_list(path: str = ''):
+    if FLAG_NO_EXPLORER or FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     if not path: return {'drives': _list_drives()}
-    if not os.path.exists(path):
+    real = os.path.realpath(path)
+    _SENSITIVE = ['/proc', '/sys', '/dev', 'C:\\Windows\\System32', 'C:\\Windows']
+    if any(real.startswith(os.path.realpath(s)) for s in _SENSITIVE):
+        return JSONResponse({'error': 'access denied'}, status_code=403)
+    if not os.path.exists(real):
         return JSONResponse({'error': 'Path not found'}, status_code=404)
     try:
         entries = []
-        for name in sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path,x)), x.lower())):
-            full = os.path.join(path, name)
+        for name in sorted(os.listdir(real), key=lambda x: (not os.path.isdir(os.path.join(real,x)), x.lower())):
+            full = os.path.join(real, name)
             try:
                 stat = os.stat(full)
                 if os.path.isdir(full):
-                    try:
-                        dir_size = sum(os.path.getsize(os.path.join(r, f)) for r, _, files in os.walk(full) for f in files)
-                    except Exception: dir_size = 0
-                    entries.append({'name': name, 'type': 'dir', 'size': dir_size, 'modified': int(stat.st_mtime)})
+                    entries.append({'name': name, 'type': 'dir', 'size': 0, 'modified': int(stat.st_mtime)})
                 else:
                     entries.append({'name': name, 'type': 'file', 'size': stat.st_size, 'modified': int(stat.st_mtime)})
             except PermissionError:
                 entries.append({'name': name, 'type': 'dir' if os.path.isdir(full) else 'file', 'size': 0, 'modified': 0, 'denied': True})
-        return {'path': path, 'entries': entries}
+        return {'path': real, 'entries': entries}
+    except PermissionError: return JSONResponse({'error': 'Permission denied'}, status_code=403)
+    except Exception as e: return JSONResponse({'error': str(e)}, status_code=500)
     except PermissionError: return JSONResponse({'error': 'Permission denied'}, status_code=403)
     except Exception as e: return JSONResponse({'error': str(e)}, status_code=500)
 
 @app.get('/explorer/download')
 async def explorer_download(path: str = ''):
+    if FLAG_NO_EXPLORER or FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     if not path or not os.path.exists(path):
         return JSONResponse({'error': 'not found'}, status_code=404)
-    if '\x00' in path:
+    real = os.path.realpath(path)
+    _SENSITIVE = ['/proc', '/sys', '/dev', 'C:\\Windows\\System32', 'C:\\Windows']
+    if any(real.startswith(os.path.realpath(s)) for s in _SENSITIVE):
         return JSONResponse({'error': 'access denied'}, status_code=403)
-    if os.path.isfile(path):
-        return FileResponse(path, filename=os.path.basename(path))
+    if os.path.isfile(real):
+        return FileResponse(real, filename=os.path.basename(real))
     buf = io.BytesIO()
     import zipfile
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(path):
+        for root, _, files in os.walk(real):
             for fname in files:
                 full = os.path.join(root, fname)
-                try: zf.write(full, os.path.relpath(full, os.path.dirname(path)))
+                try: zf.write(full, os.path.relpath(full, os.path.dirname(real)))
                 except: pass
     buf.seek(0)
     return StreamingResponse(buf, media_type='application/zip',
-                             headers={'Content-Disposition': f'attachment; filename="{os.path.basename(path)}.zip"'})
+                             headers={'Content-Disposition': f'attachment; filename="{os.path.basename(real)}.zip"'})
 
 @app.post('/explorer/download_multi')
 async def explorer_download_multi(request: Request):
+    if FLAG_NO_EXPLORER or FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     import zipfile
     d = await request.json()
     paths = d.get('paths', [])
     if not paths: return JSONResponse({'error': 'no paths'}, status_code=400)
 
-    paths = [p for p in paths if os.path.exists(p) and '\x00' not in p]
+    _SENSITIVE = ['/proc', '/sys', '/dev', 'C:\\Windows\\System32', 'C:\\Windows']
+    def _safe(p):
+        if not os.path.exists(p): return False
+        r = os.path.realpath(p)
+        return not any(r.startswith(os.path.realpath(s)) for s in _SENSITIVE)
+    paths = [p for p in paths if _safe(p)]
     if not paths: return JSONResponse({'error': 'access denied'}, status_code=403)
+    paths = [os.path.realpath(p) for p in paths]
     if len(paths) == 1 and os.path.isfile(paths[0]):
         return FileResponse(paths[0], filename=os.path.basename(paths[0]))
     buf = io.BytesIO()
@@ -1558,20 +2172,39 @@ async def explorer_download_multi(request: Request):
 
 @app.post('/explorer/upload')
 async def explorer_upload(request: Request, files: list[UploadFile] = File(...), path: str = Form(...)):
+    if FLAG_NO_EXPLORER or FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     dest_dir = path or os.path.join(os.path.expanduser('~'), 'Downloads')
     if not os.path.isdir(dest_dir):
         return JSONResponse({'error': 'Folder not found'}, status_code=400)
     saved = []
+    CHUNK_SIZE = 65536
     for f in files:
         safe = os.path.basename(f.filename)
         if not safe: continue
+        if FLAG_UPLOAD_LIMIT is not None:
+            content = await f.read()
+            if len(content) > FLAG_UPLOAD_LIMIT:
+                return JSONResponse({'error': f'File "{safe}" exceeds upload limit'}, status_code=413)
+            dest = os.path.join(dest_dir, safe)
+            base, ext = os.path.splitext(safe)
+            c = 1
+            while os.path.exists(dest):
+                dest = os.path.join(dest_dir, f"{base}_{c}{ext}"); c += 1
+            with open(dest, 'wb') as out:
+                out.write(content)
+            saved.append(safe)
+            continue
         dest = os.path.join(dest_dir, safe)
         base, ext = os.path.splitext(safe)
         c = 1
         while os.path.exists(dest):
             dest = os.path.join(dest_dir, f"{base}_{c}{ext}"); c += 1
-        content = await f.read()
-        with open(dest, 'wb') as out: out.write(content)
+        with open(dest, 'wb') as out:
+            while True:
+                chunk = await f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                out.write(chunk)
         saved.append(safe)
     return {'ok': True, 'saved': saved}
 
@@ -1726,6 +2359,7 @@ async def macros_delete(request: Request):
 
 @app.post('/macros/run')
 async def macros_run(request: Request):
+    if FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     d    = await request.json()
     name = d.get('name','')
     with _macro_lock: steps = list(macros.get(name, []))
@@ -1747,7 +2381,7 @@ async def macros_run(request: Request):
                     elif t == 'move':     pyautogui.moveRel(int(step.get('dx',0)), int(step.get('dy',0)), duration=0)
                 delay = step.get('delay', 0.1)
                 if delay > 0: time.sleep(delay)
-            except Exception as e: print(f"macro step error: {e}")
+            except Exception as e: _vprint(f"macro step error: {e}", flush=True)
     threading.Thread(target=_run, daemon=True).start()
     return {'ok': True}
 
@@ -1792,6 +2426,7 @@ async def tasks_list():
 
 @app.post('/tasks/kill')
 async def tasks_kill(request: Request):
+    if FLAG_WATCH_ONLY: return JSONResponse({'error': 'disabled'}, status_code=403)
     d   = await request.json()
     pid = d.get('pid')
     if not pid: return JSONResponse({'error': 'no pid'}, status_code=400)
@@ -1844,12 +2479,50 @@ async def auth_pin_check(request: Request):
     if ip in _pin_lockout and now < _pin_lockout[ip]:
         rem = int(_pin_lockout[ip] - now)
         return JSONResponse({'error': f'Blocked. Wait {rem} seconds'}, status_code=429)
-    d  = await request.json()
-    ok = d.get('ok', False)
+
+    d      = await request.json()
+    stored = security.get("pins", {}).get(ip)
+
+    if isinstance(stored, str):
+        client_hash = stored
+        pin_type    = 'pin'
+    elif isinstance(stored, dict):
+        client_hash = stored.get('hash')
+        pin_type    = stored.get('type', 'pin')
+    else:
+        client_hash = None
+        pin_type    = 'pin'
+
+    if d.get('_probe'):
+        return {'server_pin': bool(client_hash), 'pin_type': pin_type}
+
+    if client_hash:
+        if pin_type == 'pattern':
+            secret = str(d.get('pattern', ''))
+            if not secret:
+                return JSONResponse({'error': 'Pattern required'}, status_code=400)
+        else:
+            secret = str(d.get('pin', ''))
+            if not secret:
+                return JSONResponse({'error': 'PIN required'}, status_code=400)
+            if len(secret) != 6:
+                return JSONResponse({'error': 'PIN must be exactly 6 digits'}, status_code=400)
+        try:
+            ok = BCRYPT_AVAILABLE and _bcrypt.checkpw(secret.encode(), client_hash.encode())
+        except Exception:
+            ok = False
+    else:
+        ok = d.get('ok', False)
+
     if ok:
-        _pin_fails[ip] = 0; _pin_lockout.pop(ip, None)
+        _pin_fails[ip] = 0
+        _pin_lockout.pop(ip, None)
+        with _sec_lock:
+            security.get("lockout", {}).pop(ip, None)
+            _save_security()
         _log_event('pin_success', ip=ip)
         return {'ok': True}
+
     _pin_fails[ip] += 1
     _log_event('pin_fail', f'attempt={_pin_fails[ip]}', ip=ip)
     if _pin_fails[ip] >= PIN_MAX_TRIES:
@@ -1858,8 +2531,78 @@ async def auth_pin_check(request: Request):
         _pin_lockout_count[ip] += 1
         _pin_lockout[ip] = now + duration
         _pin_fails[ip]   = 0
+        with _sec_lock:
+            if "lockout" not in security: security["lockout"] = {}
+            security["lockout"][ip] = {"until": now + duration, "count": int(_pin_lockout_count[ip])}
+            _save_security()
         return JSONResponse({'error': f'Locked for {duration} seconds due to multiple failed attempts'}, status_code=429)
     return {'ok': False, 'remaining': PIN_MAX_TRIES - _pin_fails[ip]}
+
+
+@app.post('/auth/set_pin')
+async def auth_set_pin(request: Request):
+    ip       = request.client.host
+    d        = await request.json()
+    if d.get('_probe'): return {'ok': True}
+    pin_type = d.get('type', 'pin')
+    if not BCRYPT_AVAILABLE:
+        return JSONResponse({'error': 'bcrypt not installed on server'}, status_code=500)
+    if pin_type == 'pattern':
+        pattern = str(d.get('pattern', ''))
+        if len(pattern) < 4:
+            return JSONResponse({'error': 'Pattern must connect at least 4 nodes'}, status_code=400)
+        if not all(c in '012345678' for c in pattern) or len(set(pattern)) != len(pattern):
+            return JSONResponse({'error': 'Invalid pattern'}, status_code=400)
+        hashed = _bcrypt.hashpw(pattern.encode(), _bcrypt.gensalt()).decode()
+        with _sec_lock:
+            if "pins" not in security: security["pins"] = {}
+            security["pins"][ip] = {"hash": hashed, "type": "pattern"}
+            _save_security()
+        _log_event('pattern_set', ip=ip)
+    else:
+        pin = str(d.get('pin', ''))
+        if len(pin) != 6:
+            return JSONResponse({'error': 'PIN must be exactly 6 digits'}, status_code=400)
+        if not pin.isdigit():
+            return JSONResponse({'error': 'PIN must be digits only'}, status_code=400)
+        hashed = _bcrypt.hashpw(pin.encode(), _bcrypt.gensalt()).decode()
+        with _sec_lock:
+            if "pins" not in security: security["pins"] = {}
+            security["pins"][ip] = {"hash": hashed, "type": "pin"}
+            _save_security()
+        _log_event('pin_set', ip=ip)
+    return {'ok': True}
+
+
+@app.post('/auth/clear_pin')
+async def auth_clear_pin(request: Request):
+    ip = request.client.host
+    with _sec_lock:
+        security.get("pins", {}).pop(ip, None)
+        _save_security()
+    _log_event('pin_cleared', ip=ip)
+    return {'ok': True}
+
+
+# ── Group 2: TOFU — expose cert fingerprint ───────────────────────────────────
+def _get_cert_fingerprint():
+    cert_file = os.path.join(BASE_DIR, 'cert.pem')
+    if not os.path.isfile(cert_file):
+        return None
+    try:
+        import ssl
+        with open(cert_file) as f:
+            pem = f.read()
+        der = ssl.PEM_cert_to_DER_cert(pem)
+        raw = hashlib.sha256(der).hexdigest()
+        return ':'.join(raw[i:i+2].upper() for i in range(0, len(raw), 2))
+    except Exception:
+        return None
+
+@app.get('/security/fingerprint')
+async def security_fingerprint():
+    fp = _get_cert_fingerprint()
+    return {'fingerprint': fp, 'https': fp is not None}
 
 @app.get('/scheduled/list')
 async def scheduled_list():
@@ -1893,7 +2636,6 @@ async def scheduled_toggle(request: Request):
     return {'ok': True}
 
 
-# ── TCP_NODELAY custom uvicorn server ─────────────────────────────────────────
 import uvicorn as _uvicorn
 
 class _NoDelayServer(_uvicorn.Server):
@@ -1908,40 +2650,123 @@ class _NoDelayServer(_uvicorn.Server):
 
 
 if __name__ == '__main__':
+    import argparse
+
+    def _parse_size(s):
+        s = s.strip().upper()
+        if s.endswith('GB'): return int(float(s[:-2]) * 1024**3)
+        if s.endswith('MB'): return int(float(s[:-2]) * 1024**2)
+        if s.endswith('KB'): return int(float(s[:-2]) * 1024)
+        return int(s)
+
+    parser = argparse.ArgumentParser(prog='portdesk-server', description='PortDesk Server')
+    parser.add_argument('-p', '--port',         type=int,   default=5000,      metavar='PORT')
+    parser.add_argument('-H', '--host',         type=str,   default='0.0.0.0', metavar='HOST')
+    parser.add_argument('-s', '--ssl',          action='store_true')
+    parser.add_argument('-c', '--cert',         type=str,   default=None,      metavar='PATH')
+    parser.add_argument('-k', '--key',          type=str,   default=None,      metavar='PATH')
+    parser.add_argument('--stun',               type=str,   default=None,      metavar='HOST:PORT')
+    parser.add_argument('--whitelist',          type=str,   default=None,      metavar='PATH')
+    parser.add_argument('--watch-only',         action='store_true')
+    parser.add_argument('--no-explorer',        action='store_true')
+    parser.add_argument('--upload-limit',       type=str,   default=None,      metavar='SIZE')
+    parser.add_argument('--backend',            type=str,   default=None,      choices=['dxcam','mss'])
+    parser.add_argument('--no-webrtc',          action='store_true')
+    parser.add_argument('--scale',              type=float, default=1.0,       metavar='FACTOR')
+    parser.add_argument('--grey',               action='store_true')
+    parser.add_argument('--tray',               action='store_true')
+    parser.add_argument('--no-mouse',           action='store_true')
+    parser.add_argument('--no-keyboard',        action='store_true')
+    parser.add_argument('--verbose',            action='store_true')
+    args = parser.parse_args()
+
+    import __main__ as _main_mod
+    _main_mod.FLAG_WATCH_ONLY   = globals()['FLAG_WATCH_ONLY']   = args.watch_only
+    _main_mod.FLAG_NO_EXPLORER  = globals()['FLAG_NO_EXPLORER']  = args.no_explorer
+    _main_mod.FLAG_NO_MOUSE     = globals()['FLAG_NO_MOUSE']     = args.no_mouse
+    _main_mod.FLAG_NO_KEYBOARD  = globals()['FLAG_NO_KEYBOARD']  = args.no_keyboard
+    _main_mod.FLAG_NO_WEBRTC    = globals()['FLAG_NO_WEBRTC']    = args.no_webrtc
+    _main_mod.FLAG_GREY         = globals()['FLAG_GREY']         = args.grey
+    _main_mod.FLAG_SCALE        = globals()['FLAG_SCALE']        = args.scale
+    _main_mod.FLAG_BACKEND      = globals()['FLAG_BACKEND']      = args.backend
+    _main_mod.FLAG_VERBOSE      = globals()['FLAG_VERBOSE']      = args.verbose
+    if args.upload_limit:
+        globals()['FLAG_UPLOAD_LIMIT'] = _parse_size(args.upload_limit)
+
+    if args.whitelist:
+        globals()['SECURITY_FILE'] = args.whitelist
+
+    if args.stun and WEBRTC_AVAILABLE:
+        from aiortc import RTCIceServer as _RIS
+        globals()['STUN_SERVERS'].append(_RIS(urls=[f'stun:{args.stun}']))
+
+    _port = args.port
+    _host = args.host
+
+    cert_file = args.cert or os.path.join(BASE_DIR, 'cert.pem')
+    key_file  = args.key  or os.path.join(BASE_DIR, 'key.pem')
+    use_https = args.ssl or (os.path.isfile(cert_file) and os.path.isfile(key_file))
+    if use_https and not (os.path.isfile(cert_file) and os.path.isfile(key_file)):
+        print('⚠ --ssl specified but cert/key not found — falling back to HTTP', flush=True)
+        use_https = False
+
+    _log_level = 'debug' if args.verbose else 'warning'
+
+    if args.tray:
+        try:
+            import pystray, PIL.Image as _PIm
+            _icon_img = _PIm.new('RGB', (16,16), color=(30, 30, 200))
+            def _quit_tray(icon, item): icon.stop(); os._exit(0)
+            _tray_icon = pystray.Icon('PortDesk', _icon_img, 'PortDesk',
+                                      menu=pystray.Menu(pystray.MenuItem('Quit', _quit_tray)))
+            threading.Thread(target=_tray_icon.run, daemon=True).start()
+        except ImportError:
+            print('⚠ --tray requires pystray and Pillow: pip install pystray Pillow', flush=True)
+
     try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80)); local_ip = s.getsockname()[0]; s.close()
     except: local_ip = '0.0.0.0'
 
-    cert_file = os.path.join(BASE_DIR, 'cert.pem')
-    key_file  = os.path.join(BASE_DIR, 'key.pem')
-    use_https = os.path.isfile(cert_file) and os.path.isfile(key_file)
-
-    import sys
+    proto = 'https' if use_https else 'http'
     print(f"\n{'═'*52}", flush=True)
     print(f"  🎮  PortDesk v1.0 ", flush=True)
     print(f"{'─'*52}", flush=True)
     print(f"  ✍  Developed by  :  Lucky_abdo", flush=True)
     print(f"  🔗  GitHub        :  github.com/Lucky-abdo/PortDesk", flush=True)
     print(f"{'─'*52}", flush=True)
-    print(f"  ℹ  WebRTC screen streaming: {'✅ available' if WEBRTC_AVAILABLE else '⚠️ aiortc not installed — WS fallback only'}", flush=True)
-    print(f"  ℹ  Screen capture backend : {'dxcam (DirectX)' if DXCAM_AVAILABLE and platform.system() == 'Windows' else 'mss (fallback)'}", flush=True)
+    print(f"  ℹ  WebRTC screen streaming: {'✅ available' if WEBRTC_AVAILABLE and not args.no_webrtc else '⚠️ disabled' if args.no_webrtc else '⚠️ aiortc not installed — WS fallback only'}", flush=True)
+    print(f"  ℹ  WebRTC STUN layer      : {'✅ enabled' if WEBRTC_AVAILABLE and not args.no_webrtc else '⚠️ unavailable'}", flush=True)
+    _be = 'forced: mss' if args.backend == 'mss' else 'forced: dxcam' if args.backend == 'dxcam' else ('dxcam (DirectX)' if DXCAM_AVAILABLE and platform.system() == 'Windows' else 'mss (fallback)')
+    print(f"  ℹ  Screen capture backend : {_be}", flush=True)
+    if args.watch_only:   print(f"  ℹ  Mode                   : 👁 Watch-only", flush=True)
+    if args.no_explorer:  print(f"  ℹ  File explorer          : ⛔ disabled", flush=True)
+    if args.upload_limit: print(f"  ℹ  Upload limit           : {args.upload_limit}", flush=True)
+    if args.scale != 1.0: print(f"  ℹ  Stream scale           : {args.scale}x", flush=True)
+    if args.grey:         print(f"  ℹ  Stream color           : greyscale", flush=True)
     print(f"{'═'*52}", flush=True)
+    print(f"  [USB]  adb reverse tcp:{_port} tcp:{_port} → {proto}://localhost:{_port}", flush=True)
+    print(f"  [WiFi] {proto}://{local_ip}:{_port}", flush=True)
     if use_https:
-        print(f"  [USB]  adb reverse tcp:5000 tcp:5000 → https://localhost:5000", flush=True)
-        print(f"  [WiFi] https://{local_ip}:5000", flush=True)
         print(f"  🔒 HTTPS enabled", flush=True)
+        _fp = _get_cert_fingerprint()
+        if _fp:
+            print(f"{'─'*52}", flush=True)
+            print(f"  🔐 Cert Fingerprint (SHA-256):", flush=True)
+            print(f"  {_fp}", flush=True)
+            print(f"  ↑ Verify this matches on your mobile client (TOFU)", flush=True)
     else:
-        print(f"  [USB]  adb reverse tcp:5000 tcp:5000 → http://localhost:5000", flush=True)
-        print(f"  [WiFi] http://{local_ip}:5000", flush=True)
-        print(f"  ⚠ HTTP only — run gen_cert.py to enable HTTPS", flush=True)
+        print(f"{'─'*52}", flush=True)
+        print(f"  ⚠⚠⚠  HTTP MODE — TRAFFIC IS UNENCRYPTED  ⚠⚠⚠", flush=True)
+        print(f"  Screen stream, keyboard input and clipboard", flush=True)
+        print(f"  are visible to anyone on your network.", flush=True)
+        print(f"  Run gen_cert.py to enable HTTPS.", flush=True)
     print(f"{'═'*50}\n", flush=True)
-    sys.stdout.flush()
 
     if use_https:
-        cfg = _uvicorn.Config(app, host='0.0.0.0', port=5000,
-                              ssl_certfile=cert_file, ssl_keyfile=key_file, log_level='warning')
+        cfg = _uvicorn.Config(app, host=_host, port=_port,
+                              ssl_certfile=cert_file, ssl_keyfile=key_file, log_level=_log_level)
     else:
-        cfg = _uvicorn.Config(app, host='0.0.0.0', port=5000, log_level='warning')
+        cfg = _uvicorn.Config(app, host=_host, port=_port, log_level=_log_level)
 
     _NoDelayServer(cfg).run()
