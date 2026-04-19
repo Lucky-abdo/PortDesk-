@@ -2,7 +2,6 @@
 
 # 🎮 PortDesk
 
-**Control your PC from any device browser. No app needed.**
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
@@ -12,20 +11,20 @@
 
 ---
 
+### What is PortDesk?
+PortDesk transforms any device into a PC controller. It works seamlessly over your local network (Wi-Fi or USB) or via the internet—allowing you to control your computer by simply opening a URL in any web browser.
 ## ⚠️ Official Source
 
 **The only official and verified release of PortDesk is hosted at:**  
-👉 `https://github.com/Lucky_abdo/PortDesk`
+👉 `https://github.com/Lucky-abdo/PortDesk`
 
 Copies or forks obtained from third-party websites, messaging groups, or unofficial links may have been modified. We cannot guarantee that such versions retain the same privacy standards, security model, or integrity as the original. Please exercise caution and always verify the source before running any code on your machine.
 
 ---
 
-## What is PortDesk?
+## Having an issue?
 
-PortDesk turns any device into a full PC controller over your local network (WiFi or USB).  
-No installation needed — just open a URL in any browser.  
-Everything runs **locally on your machine**. Nothing is sent to the internet. Ever.
+Check **`notes.txt`** first — it covers common problems, platform-specific fixes, CLI flags, PIN/pattern recovery, TOFU certificate warnings, and streaming troubleshooting. Most questions are answered there.
 
 ---
 
@@ -42,27 +41,8 @@ Read the following PortDesk documentation and give the user a clear, concise sum
 ### 1. Install dependencies
 
 ```bash
-pip install fastapi uvicorn pyautogui opencv-python mss psutil pyperclip sounddevice numpy Pillow python-multipart
+python -m pip install -r requirements.txt
 ```
-
-**Optional (for better performance):**
-```bash
-pip install dxcam          # Windows only — faster screen capture via DirectX
-pip install PyTurboJPEG    # faster JPEG encoding
-pip install aiortc         # WebRTC support
-pip install cryptography   # for HTTPS/SSL
-```
-
-**Optional (for H264 hardware streaming):**
-```bash
-# Windows
-winget install ffmpeg
-# Linux
-sudo apt install ffmpeg
-# macOS
-brew install ffmpeg
-```
-> Without FFmpeg, streaming falls back to JPEG mode automatically.
 
 ### 2. Run the server
 
@@ -70,7 +50,7 @@ brew install ffmpeg
 python portdesk-server.py
 ```
 
-## **Recomended run it by start file
+> **Recommended:** Use the start file for best results — on Windows use `start_portdesk.bat`, on Linux/macOS use the matching shell script. This prevents focus issues with keyboard input.
 
 You'll see something like:
 ```
@@ -112,7 +92,8 @@ You can use PortDesk without any WiFi router by creating a hotspot directly from
 - Connect your device and PC to the same WiFi network
 - Open the IP shown in the terminal on any browser
 - Works from phones, tablets, laptops, other PCs — anything with a browser
-**make sure that you are on the main network not guest or data network
+
+> **Make sure you are on the main network, not a guest or mobile data network.**
 
 ### USB Mode — Android
 Requires [ADB (Android Debug Bridge)](https://developer.android.com/tools/adb) installed on PC.
@@ -281,14 +262,14 @@ Enable/disable individual tasks with the toggle. The server checks every 10 seco
 
 ### 📝 Log Tab
 Two views:
-- **Server:** Events logged by the server (connections, pin attempts, audio start/stop, etc.)
+- **Server:** Events logged by the server 
 - **Client:** Real-time JavaScript log from your device — useful for debugging
 
 ### ⚙️ Settings
 - Touch sensitivity, gyro sensitivity, dead zone, scroll speed
 - Haptic feedback, sound feedback
 - Auto-sleep timer
-- PIN lock
+- PIN lock (6-digit) and Pattern lock
 - Backup & restore settings (JSON export/import)
 - Whitelist management
 - AI reset
@@ -301,23 +282,21 @@ Two views:
 
 ##  Security & Whitelist
 
-PortDesk is designed for local network use only. It has a built-in IP whitelist system.
-
 **How it works:**
 - When a new device tries to connect over WiFi, the server prints a prompt in the terminal asking you to allow or deny it
 - Type `y` to add the device to the whitelist, `n` to reject
 - The whitelist is saved in `portdesk_security.json`
 - Whitelisted devices connect automatically in the future
 
-**Manage the whitelist from the phone:**
-- Settings → Add this device to whitelist (adds current phone)
-- Settings → Clear whitelist (reset — all devices must re-request access)
-
 **PIN Lock:**
-- Settings → Set PIN — set a 4-digit PIN
+- Settings → Set PIN — set a 6-digit PIN, or use Set Pattern for a gesture-based lock
 - Anyone opening the URL must enter it before accessing the controller
-- PIN is stored as a salted SHA-256 hash in the browser, never sent to the server in plain text
-- After 5 wrong attempts, the server locks the IP for 60 seconds
+- PIN is verified server-side using bcrypt. A SHA-256 hash is also stored locally in the browser for offline lock functionality
+- After 5 wrong attempts, the server locks the IP for 60 seconds (escalating: 60s → 180s → 300s)
+
+**Manage the whitelist from the phone:**
+- Settings → Add this device to whitelist (adds current device)
+- Settings → Remove myself from whitelist (removes only your own device — no device can remove others)
 
 ---
 
@@ -373,6 +352,7 @@ Uses your device's microphone as a virtual mic on the PC.
 | `gen_cert.py` | Generates self-signed SSL certificate for HTTPS |
 | `fixer.py` | Diagnostics and auto-repair tool |
 | `requirements.txt` | Python dependencies |
+| `notes.txt` | Troubleshooting, CLI flags, known issues, and recovery guides |
 | `portdesk_security.json` | Whitelist (auto-created, not in repo) |
 | `portdesk_macros.json` | Saved macros (auto-created) |
 | `portdesk_scheduled.json` | Scheduled tasks (auto-created) |
