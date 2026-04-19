@@ -1,7 +1,6 @@
-# PortDesk — Python Dependencies
 # Install with: pip install -r requirements.txt
 
-# ── Core (required) ───────────────────────────────────────────────────────────
+# --- Core (Required) ---------------------------------------------------------
 fastapi>=0.109.1
 uvicorn[standard]>=0.23.0
 pyautogui>=0.9.53
@@ -13,34 +12,39 @@ sounddevice>=0.4.0
 numpy>=1.22.0
 Pillow>=10.0.0
 python-multipart>=0.0.18
+bcrypt>=4.0.0
 
-# ── Optional (performance) ────────────────────────────────────────────────────
-# dxcam            — DirectX-based screen capture for Windows (fastest, recommended)
+# Security & Stability (Pinned by Snyk)
+starlette>=0.40.0
+anyio>=4.4.0
+zipp>=3.19.1
+
+# --- Optional (Performance & Features) ---------------------------------------
+
+# dxcam            - DirectX-based screen capture for Windows (fastest, recommended)
 #                    pip install dxcam
-# PyTurboJPEG      — Hardware-accelerated JPEG encoding (lower CPU usage)
+# PyTurboJPEG      - Hardware-accelerated JPEG encoding (lower CPU usage)
 #                    pip install PyTurboJPEG
-# aiortc           — WebRTC support for screen streaming
+# aiortc           - WebRTC support for screen streaming
 #                    pip install aiortc
-# FFmpeg           — H264 hardware encoding (h264_amf / h264_nvenc / h264_qsv)
+# cryptography     - Required for HTTPS/SSL certificate generation
+#                    pip install cryptography
+# python-uinput    - Virtual keyboard on Linux (requires root)
+#                    pip install python-uinput
+
+# --- External Tools ----------------------------------------------------------
+
+# FFmpeg           - H264 hardware encoding (h264_amf / h264_nvenc / h264_qsv)
 #                    Windows: winget install ffmpeg
 #                    Linux:   sudo apt install ffmpeg
 #                    macOS:   brew install ffmpeg
-#                    Without FFmpeg, streaming falls back to JPEG mode automatically.
+#                    *Without FFmpeg, streaming falls back to JPEG mode.
 
-# ── Optional (features) ───────────────────────────────────────────────────────
-# python-uinput    — Virtual keyboard on Linux (requires root)
-#                    pip install python-uinput
-# cryptography     — Required for HTTPS/SSL certificate generation
-#                    pip install cryptography
+# Linux extra:     sudo apt install xdotool xclip xsel libportaudio2
 
-# ── Platform Notes ────────────────────────────────────────────────────────────
-# Python:   3.8 or higher (3.11/3.12 recommended)
+# --- Platform Notes ----------------------------------------------------------
+# Python:   3.8 or higher (3.11/3.12 recommended) 
+#           *Avoid 3.14 on Windows due to asyncio ProactorEventLoop issues.
 # Windows:  7 and above (10/11 recommended)
 # Linux:    Ubuntu 20.04+, Debian 11+, or any modern distro
 # macOS:    10.14 (Mojave) or later
-
-# ── Linux extra tools (via apt) ───────────────────────────────────────────────
-# sudo apt install xdotool xclip xsel
-starlette>=0.40.0 # not directly required, pinned by Snyk to avoid a vulnerability
-anyio>=4.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
-zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
