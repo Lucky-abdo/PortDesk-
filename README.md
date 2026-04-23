@@ -22,12 +22,6 @@ Copies or forks obtained from third-party websites, messaging groups, or unoffic
 
 ---
 
-## Having an issue?
-
-Check **`notes.txt`** first — it covers common problems, platform-specific fixes, CLI flags, PIN/pattern recovery, TOFU certificate warnings, and streaming troubleshooting. Most questions are answered there.
-
----
-
 ### Lazy to read ?
 give this prompt to ai
 ```bash
@@ -40,9 +34,8 @@ Read the following PortDesk documentation and give the user a clear, concise sum
 
 ### 1. Install dependencies
 
-```bash
-python -m pip install -r requirements.txt
-```
+[requirements](requirements)
+
 
 ### 2. Run the server
 
@@ -155,6 +148,11 @@ Then use `https://` instead of `http://` when opening on your device.
 Accept the self-signed certificate warning in the browser.
 
 ---
+
+## Having an issue?
+
+Check **`notes.txt`** first — it covers common problems, platform-specific fixes, CLI flags, PIN/pattern recovery, TOFU certificate warnings, and streaming troubleshooting. Most questions are answered there.
+
 
 ## Features
 
