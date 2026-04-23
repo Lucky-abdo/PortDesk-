@@ -18,7 +18,7 @@ mss==9.0.2
 
 # ── Windows-only: DXCam for faster screen capture ───────────
 # Automatically skipped on Linux/Mac by pip
-dxcam==0.3.2; sys_platform == "win32"
+dxcam==0.3.0; sys_platform == "win32"
 
 # ── Linux-only: Virtual keyboard ────────────────────────────
 # Automatically skipped on Windows/Mac by pip
