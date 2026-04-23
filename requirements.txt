@@ -2,7 +2,7 @@
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.2
-python-multipart==0.0.20
+python-multipart==0.0.26
 bcrypt==4.2.1
 pyautogui==0.9.54
 pyperclip==1.9.0
@@ -15,7 +15,7 @@ aiortc==1.9.0
 av==14.2.0
 aioice==0.9.0
 pystray==0.19.5
-Pillow==10.4.0
+Pillow==12.2.0
 
 # --------------------------------------
 
@@ -23,7 +23,7 @@ Pillow==10.4.0
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.2
-python-multipart==0.0.20
+python-multipart==0.0.26
 bcrypt==4.2.1
 pyautogui==0.9.54
 pyperclip==1.9.0
@@ -44,7 +44,7 @@ Pillow==11.1.0
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.2
-python-multipart==0.0.20
+python-multipart==0.0.26
 bcrypt==4.2.1
 pyautogui==0.9.54
 pyperclip==1.9.0
