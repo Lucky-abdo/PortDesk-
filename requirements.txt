@@ -14,6 +14,7 @@ psutil==6.1.1
 # ── Screen Capture & Streaming ──────────────────────────────
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
+numpy==2.1.3 sys_platform == "linux"
 mss==9.0.2
 
 # ── Windows-only: DXCam for faster screen capture ───────────
